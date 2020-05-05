@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
@@ -49,7 +50,7 @@ namespace Libplanet.Tests.Net.Messages
             // This test lengthens long... Please read the brief description of the entire payload
             // structure from the comment in the RecentStates.DataFrames property code.
             ISet<Address> accounts = Enumerable.Repeat(0, 5).Select(_ =>
-                new PrivateKey().PublicKey.ToAddress()
+                new PrivateKey().ToAddress()
             ).ToHashSet();
             int accountsCount = accounts.Count;
             var privKey = new PrivateKey();
@@ -96,7 +97,9 @@ namespace Libplanet.Tests.Net.Messages
             RecentStates reply =
                 new RecentStates(blockHash, -1, 1, compressedBlockStates, stateRefs);
 
-            Peer peer = new BoundPeer(privKey.PublicKey, new DnsEndPoint("0.0.0.0", 1234), 0);
+            var versionSigner = new PrivateKey();
+            AppProtocolVersion version = AppProtocolVersion.Sign(versionSigner, 1);
+            Peer peer = new BoundPeer(privKey.PublicKey, new DnsEndPoint("0.0.0.0", 1234), version);
 
             NetMQMessage msg = reply.ToNetMQMessage(privKey, peer);
             const int headerSize = 3;  // type, peer, sig
@@ -141,11 +144,13 @@ namespace Libplanet.Tests.Net.Messages
                 var addr = new Address(msg[offset + 2].Buffer);
                 Assert.Equal(compressedBlockStates[hash].Keys.First(), addr);
 
-                using (var stream = new MemoryStream())
+                using (var compressed = new MemoryStream(msg[offset + 3].Buffer))
+                using (var df = new DeflateStream(compressed, CompressionMode.Decompress))
+                using (var decompressed = new MemoryStream())
                 {
-                    stream.Write(msg[offset + 3].Buffer, 0, msg[offset + 3].BufferSize);
-                    stream.Seek(0, SeekOrigin.Begin);
-                    string state = ((Text)codec.Decode(stream)).Value;
+                    df.CopyTo(decompressed);
+                    decompressed.Seek(0, SeekOrigin.Begin);
+                    string state = ((Text)codec.Decode(decompressed)).Value;
                     Assert.Equal($"B:{hash}:{addr}", state);
                 }
             }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.Serialization.Formatters.Binary;
+using Libplanet.Blocks;
 using Libplanet.Crypto;
 using NetMQ;
 
@@ -26,11 +27,6 @@ namespace Libplanet.Net.Messages
             /// Request to query block hashes.
             /// </summary>
             GetBlockHashes = 0x04,
-
-            /// <summary>
-            /// Inventory to transfer blocks.
-            /// </summary>
-            BlockHashes = 0x05,
 
             /// <summary>
             /// Inventory to transfer transactions.
@@ -76,7 +72,17 @@ namespace Libplanet.Net.Messages
             /// A reply to <see cref="GetRecentStates"/>.
             /// Contains the calculated recent states and state references.
             /// </summary>
-            RecentStates = 0x0c,
+            RecentStates = 0x0f,
+
+            /// <summary>
+            /// Message containing a single <see cref="BlockHeader"/>.
+            /// </summary>
+            BlockHeaderMessage = 0x0d,
+
+            /// <summary>
+            /// Message containing demand block hashes with their index numbers.
+            /// </summary>
+            BlockHashes = 0x0e,
         }
 
         public byte[] Identity { get; set; }
@@ -118,6 +124,7 @@ namespace Libplanet.Net.Messages
                 { MessageType.Neighbors, typeof(Neighbors) },
                 { MessageType.GetRecentStates, typeof(GetRecentStates) },
                 { MessageType.RecentStates, typeof(RecentStates) },
+                { MessageType.BlockHeaderMessage, typeof(BlockHeaderMessage) },
             };
 
             if (!types.TryGetValue(rawType, out Type type))
@@ -176,20 +183,16 @@ namespace Libplanet.Net.Messages
         protected static Peer DeserializePeer(byte[] bytes)
         {
             var formatter = new BinaryFormatter();
-            using (MemoryStream stream = new MemoryStream(bytes))
-            {
-                return (Peer)formatter.Deserialize(stream);
-            }
+            using MemoryStream stream = new MemoryStream(bytes);
+            return (Peer)formatter.Deserialize(stream);
         }
 
         protected byte[] SerializePeer(Peer peer)
         {
             var formatter = new BinaryFormatter();
-            using (MemoryStream stream = new MemoryStream())
-            {
-                formatter.Serialize(stream, peer);
-                return stream.ToArray();
-            }
+            using MemoryStream stream = new MemoryStream();
+            formatter.Serialize(stream, peer);
+            return stream.ToArray();
         }
     }
 }

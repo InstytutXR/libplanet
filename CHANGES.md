@@ -1,13 +1,213 @@
 Libplanet changelog
 ===================
 
-Version 0.8.0
--------------
+Version 0.10.0
+--------------
 
 To be released.
 
 ### Backward-incompatible API changes
 
+### Backward-incompatible network protocol changes
+
+### Backward-incompatible storage format changes
+
+### Added APIs
+
+### Behavioral changes
+
+ -  Improved performance of `Swarm<T>` by multiplexing response and
+    broadcast.  [[#858], [#859]]
+
+### Bug fixes
+
+### CLI tools
+
+[#858]: https://github.com/planetarium/libplanet/issues/858
+[#859]: https://github.com/planetarium/libplanet/pull/859
+
+Version 0.9.0
+-------------
+
+Released on April 27, 2020.
+
+### Backward-incompatible API changes
+
+ -  `BaseStore` class became to implement `IDisposable`.  [[#789]]
+ -  Removed `IStore.DeleteIndex(Guid, HashDigest<SHA256>)` method.  [[#802]]
+ -  Extension classes was renamed.  However, it would not be affected
+    if you have called it by using instance method syntax.  [[#803]]
+     -  Renamed `StunAddressExtension` class to `StunAddressExtensions`.
+     -  Renamed `BytesConvertExtension` class to `BytesConvertExtensions`.
+     -  Renamed `RandomExtension` class to `RandomExtensions`.
+     -  Renamed `AddressExtension` class to `AddressExtensions`.
+     -  Renamed `HashDigestExtension` class to `HashDigestExtensions`.
+     -  Renamed `NetMQFrameExtension` class to `NetMQFrameExtensions`.
+     -  Renamed `NetMQSocketExtension` class to `NetMQSocketExtensions`.
+     -  Renamed `SerializationInfoExtension` class to
+        `SerializationInfoExtensions`.
+     -  Renamed `StoreExtension` class to `StoreExtensions`.
+ -  All parameters, fields, property, and method return values that had been
+    represented as an `Int32` became retyped to `AppProtocolVersion`.
+    [[#266], [#815]]
+     -  `Swarm()` constructor's parameter `appProtocolVersion` became
+        `AppProtocolVersion` (was `Int32`).
+     -  `Peer()` and `BoundPeer()` constructors' parameter `appProtocolVersion`
+        became `AppProtocolVersion` (was `Int32`).
+     -  `Peer.AppProtocolVersion` property became `AppProtocolVersion`
+        (was `Int32`).
+     -  `DifferentProtocolVersionEventArgs.ExpectedVersion` and
+        `DifferentProtocolVersionEventArgs.ActualVersion` properties became
+        `AppProtocolVersion` (was `Int32`).
+     -  Removed `DifferentAppProtocolVersionException` class.
+ -  `Swarm()` constructor's `EventHandler<DifferentProtocolVersionEventArgs>
+    differentVersionPeerEncountered = null` parameter became replaced by
+    `DifferentAppProtocolVersionEncountered
+    differentAppProtocolVersionEncountered = null` parameter.  [[#266], [#815]]
+ -  Added `IEnumerable<PublicKey> trustedAppProtocolVersionSigners = null`
+    parameter to `Swarm()` constructor.  [[#266], [#815]]
+ -  Removed `DifferentProtocolVersionEventArgs` class.  [[#266], [#815]]
+ -  Removed `createdAt` parameter from `Swarm()` constructor.  [[#838]]
+ -  Replaced `BlockChain<T>.StageTransactions()` with `.StageTransaction()`
+    that receives only one transaction.  [[#820]]
+ -  Replaced `BlockChain<T>.UnstageTransactions()` with `.UnstageTransaction()`
+    that receives only one transaction.  [[#820]]
+ -  Added `IBlockPolicy.DoesTransactionFollowPolicy()` method which is a method to
+    determine if a transaction follows the block policy.  [[#827]]
+
+### Backward-incompatible network protocol changes
+
+ -  The existing `BlockHashes` message type (with the type number `0x05`) was
+    replaced by a new `BlockHashes` message type (with type number `0x0e`)
+    in order to include an offset block index besides block hashes
+    so that a receiver is able to determine their block indices too.
+    [[#707], [#798]]
+ -  `Peer` became to have 3 more fields to represent the whole fields of
+    `AppProtocolVersion`, which is newly introduced.  [[#266], [#815]]
+ -  The existing `RecentStates` message type (with the type number `0x0c`) was
+    replaced by a new `RecentStates` message type (with type number `0x0f`)
+    in order to compress its states.  [[#700], [#850]]
+
+### Added APIs
+
+ -  Added `AddressExtensions.ToAddress(this PrivateKey)` overloaded extension
+    method.  [[#825]]
+ -  Added `BlockHashDownloadState` class, a subclass of `PreloadState`.
+    [[#707], [#798]]
+ -  Added `BlockVerificationState` class, a subclass of `PreloadState`.
+    [[#798]]
+ -  Added `AppProtocolVersion` struct.  [[#266], [#815]]
+ -  Added `IKeyStore` interface.  [[#831]]
+ -  Added `Web3KeyStore` class.  [[#831]]
+ -  Added `BlockDigest` struct.  [[#785]]
+ -  Added `BlockHeader` struct.  [[#785]]
+ -  Added `IStore.GetBlockDigest(HashDigest<SHA256>)` method.  [[#785]]
+ -  Added `Block<T>.ToBlockDigest()` method.  [[#785]]
+ -  Added `ByteArrayExtensions` class.  [[#803]]
+ -  Added `IStore.PruneBlockStates<T>(Guid, Block<T>)` method.  [[#790]]
+ -  Added `DifferentAppProtocolVersionEncountered` delegate.  [[#266], [#815]]
+ -  Added `Swarm<T>.TrustedAppProtocolVersionSigners` property.
+    [[#266], [#815]]
+ -  Added `Peer.IsCompatibleWith()` method.  [[#266], [#815]]
+ -  Added `TxViolatingBlockPolicyException` class.  [[#827]]
+ -  Added `KeyStoreException` class.  [[#831]]
+ -  Added `NoKeyException` class.  [[#831]]
+
+### Behavioral changes
+
+ -  `BlockChain.MineBlock()` method became to ignore transactions having
+    lower nonce than the expected nonce in the chain.  [[#791]]
+ -  `Swarm<T>.PreloadAsync()` and `Swarm<T>.StartAsync()` became to download
+    only a list of block hashes first and then download blocks from
+    simultaneously multiple peers.  [[#707], [#798]]
+ -  Improved performance of `Swarm<T>` by preventing unnecessary task
+    creation.  [[#817], [#837]]
+ -  Improved performance of `Swarm<T>.PreloadAsync()` by parallelizing
+    connections.  [[#846]]
+ -  Improved response throughput of `Swarm<T>`.  [[#849]]
+
+### Bug fixes
+
+ -  `Swarm<T>` became not to sync the same `Block<T>`s or `Transaction<T>`s
+    multiple times.  [[#784]]
+ -  Fixed a `Swarm<T>`'s bug that had broadcasted a message to its source peer
+    when the number of peers is not enough (less than the minimum number).
+    [[#788]]
+ -  Fixed a bug where `BlockChain.MineBlock()` had produced an invalid block
+    when there is any staged transaction which has lower nonce than the expected
+    nonce, that means, shares an already taken nonce by the same signer.
+    [[#791]]
+ -  Fixed a `Swarm<T>.PreloadAsync()` method's bug that temporary chain IDs
+    in the store had been completely cleaned up in some corner cases
+    if `cancellationToken` was requested.  [[#798]]
+ -  Fixed a bug where `Swarm<T>` had crashed if it received invalid
+    `Transaction<T>` from the nodes.  [[#820]]
+ -  Fixed a bug where `Swarm<T>` hadn't reported `IProgress<PreloadState>`s
+    correctly.[[#839]]
+ -  Fixed a `Swarm<T>.PreloadAsync()` method's bug that it had hung forever
+    when a block failed to be fetched due to an unexpected inner exception.
+    [[#839]]
+ -  Fixed a bug where actions had been evaluated twice when receiving blocks.
+    [[#843], [#844]]
+ -  Fixed `OverflowException` being thrown when a `passphrase` containing
+    any non-ASCII characters was passed to `Pbkdf2.Derive()` method or
+    `ProtectedPrivateKey.Protect()` method.  [[#845]]
+
+### CLI tools
+
+ -  Added the `planet` command and its alias `dotnet planet`.
+
+[#266]: https://github.com/planetarium/libplanet/issues/266
+[#700]: https://github.com/planetarium/libplanet/issues/700
+[#707]: https://github.com/planetarium/libplanet/pull/707
+[#784]: https://github.com/planetarium/libplanet/pull/784
+[#785]: https://github.com/planetarium/libplanet/pull/785
+[#788]: https://github.com/planetarium/libplanet/pull/788
+[#789]: https://github.com/planetarium/libplanet/pull/789
+[#790]: https://github.com/planetarium/libplanet/pull/790
+[#791]: https://github.com/planetarium/libplanet/pull/791
+[#798]: https://github.com/planetarium/libplanet/pull/798
+[#802]: https://github.com/planetarium/libplanet/pull/802
+[#803]: https://github.com/planetarium/libplanet/pull/803
+[#815]: https://github.com/planetarium/libplanet/pull/815
+[#817]: https://github.com/planetarium/libplanet/issues/817
+[#820]: https://github.com/planetarium/libplanet/pull/820
+[#825]: https://github.com/planetarium/libplanet/pull/825
+[#827]: https://github.com/planetarium/libplanet/pull/827
+[#831]: https://github.com/planetarium/libplanet/pull/831
+[#837]: https://github.com/planetarium/libplanet/pull/837
+[#838]: https://github.com/planetarium/libplanet/pull/838
+[#839]: https://github.com/planetarium/libplanet/pull/839
+[#843]: https://github.com/planetarium/libplanet/issues/843
+[#844]: https://github.com/planetarium/libplanet/pull/844
+[#845]: https://github.com/planetarium/libplanet/pull/845
+[#846]: https://github.com/planetarium/libplanet/pull/846
+[#849]: https://github.com/planetarium/libplanet/pull/849
+[#850]: https://github.com/planetarium/libplanet/pull/850
+
+
+Version 0.8.0
+-------------
+
+Released on February 4, 2020.
+
+### Backward-incompatible API changes
+
+ -  The internal representation for state keys became `string` (was `Address`).
+    [[#368], [#774]]
+     -  The return type of `IStore.GetBlockStates()` method became
+        `IImmutableDictionary<string, IValue>` (was `AddressStateMap`,
+        which was removed too).  [[#368], [#774]]
+     -  The type of the second parameter of `IStore.SetBlockStates()` method
+        became `IImmutableDictionary<string, IValue>` (was `AddressStateMap`,
+        which was removed too).  [[#368], [#774]]
+     -  The second parameter of `IStore.IterateStateReferences()` method became
+        `string key` (was `Address address`).  [[#368], [#774]]
+     -  The second parameter of `IStore.StoreStateReference()` method became
+        `IImmutableSet<string> keys` (was `IImmutableSet<Address> addresses`).
+        [[#368], [#774]]
+     -  `IStore.ListAddresses()` method was replaced by `IStore.ListStateKeys()`
+        method. [[#368], [#774]]
  -  Added `Swarm<T>.FindSpecificPeer()` method to find a specific peer given
     the address.  [[#570], [#580]]
  -  Removed `LiteDBStore` class.  Use `DefaultStore` instead.  [[#662]]
@@ -20,17 +220,16 @@ To be released.
     method and `BlockChain<T>[HashDigest<SHA256>]` indexer as lookups only
     the current chain, not entire storage.  [[#678]]
  -  Added `IStore.ContainsBlock(HashDigest<SHA256>)` method.  [[#678]]
- -  Removed `AddressStateMap` class.  [[#98], [#692]]
+ -  Removed `AddressStateMap` class.  [[#98], [#368], [#692], [#774]]
      -  The return type of `BlockChain<T>.GetState()` method became `IValue`
         (was `AddressStateMap`).
      -  The return type of `IStore.GetBlockStates()` method became
-        `IImmutableDictionary<Address, IValue>` (was `AddressStateMap`).
+        `IImmutableDictionary<string, IValue>` (was `AddressStateMap`).
      -  `IStore.SetBlockStates()` method became to take
-        `IImmutableDictionary<Address, IValue>` instead of `AddressStateMap`.
+        `IImmutableDictionary<string, IValue>` instead of `AddressStateMap`.
  -  `Swarm<T>.PreloadAsync()` method and `Swarm<T>.StartAsync()` method became
     to take `preloadBlockDownloadFailed` event handler as an argument.
     [[#694]]
- -  Removed `StoreExtension` class.  [[#701], [#722]]
  -  Added the `genesisBlock` parameter to
     `BlockChain<T>()` constructor.  [[#688]]
  -  Removed `StateReferenceDownloadState` class.  [[#703]]
@@ -39,6 +238,18 @@ To be released.
     from `Swarm<T>`.  [[#705], [#725]]
  -  Added `workers` optional parameter into `Swarm<T>()` constructor.
     [[#613], [#727]]
+ -  `Block<T>` class became not to implement `ISerializable`.  [[#751]]
+ -  `Transaction<T>` class became not to implement `ISerializable`.  [[#751]]
+ -  `Block<T>.ToBencodex()` became to return `Bencodex.Types.Dictionary`.
+    [[#751]]
+ -  `Transaction<T>.ToBencodex()` became to return `Bencodex.Types.Dictionary`.
+    [[#751]]
+ -  Removed `Block<T>.FromBencodex(byte[])` method.  [[#751]]
+ -  Removed `Transaction<T>.FromBencodex(byte[])` method.  [[#751]]
+ -  `Block<T>.ToBencodex()` became to take no arguments.  [[#749], [#757]]
+ -  Removed `Swarm<T>.BroadcastBlocks(IEnumerable<Block<T>>)` method.  [[#764]]
+ -  `StoreExtension.LookupStateReference<T>()` method was replaced by
+    `IStore.LookupStateReference<T>()` method.  [[#722], [#774]]
 
 ### Backward-incompatible network protocol changes
 
@@ -46,6 +257,7 @@ To be released.
     `GetRecentStates` messages.  [[#703]]
  -  Added `int`-typed `iteration` parameter to `RecentStates` message.
     [[#703]]
+ -  Added `BlockHeaderMessage` message.  [[#764]]
 
 ### Backward-incompatible storage format changes
 
@@ -58,16 +270,36 @@ To be released.
 
  -  Added `DefaultStore` class to replace `LiteDBStore`.  [[#662]]
  -  Added `IStore.ListAllStateReferences<T>()` method.  [[#701], [#703]]
+ -  Added `IStore.ListStateKeys()` method to replace `IStore.ListAddresses()`
+    method.  [[#368], [#774]]
+ -  Added `IStore.LookupStateReference<T>()` method to replace
+    `StoreExtension.LookupStateReference<T>()` method.  [[#368], [#722], [#774]]
  -  Added `BlockChain<T>.Genesis` property.  [[#688]]
  -  Added `BlockChain<T>.MakeGenesisBlock()` static method.  [[#688]]
  -  Added `InvalidGenesisBlockException` class.  [[#688]]
- -  Added `StateDownloadState` class which reports state preloading iteration
-    progress.  [[#703]]
+ -  Added `StateDownloadState` class, a subclass of `PreloadState`,
+    which reports state preloading iteration progress.  [[#703]]
  -  Added `PeerDiscoveryException` class which inherits `SwarmException`
     class.  [[#604], [#726]]
  -  Added `Swarm<T>.Peers` property which returns an enumerable of peers in
     `Swarm<T>`'s routing table.  [[#739]]
- -  Added `IStore.LookupStateReference<T>()` method.  [[#722]]
+ -  Added `Block<T>.Serialize()` method which returns `byte[]`.  [[#751]]
+ -  Added `Transaction<T>.Serialize()` method which returns `byte[]`.  [[#751]]
+ -  Added `Block<T>(Bencodex.Types.Dictionary)` constructor.  [[#751]]
+ -  Added `Transaction<T>(Bencodex.Types.Dictionary)` constructor.  [[#751]]
+ -  Added `Block<T>.Deserialize(byte[])` method.  [[#751]]
+ -  Added `Transaction<T>.Deserialize(byte[])` method.  [[#751]]
+ -  Added `StoreExtension.Copy(this IStore, IStore)` extension method.  [[#753]]
+ -  Added a `HashDigest<SHA256>?`-typed `TxHash` property which digests
+    all transactions in the block to `Block<T>` class.  [[#749], [#757]]
+ -  Added `CryptoConfig` class.  [[#758]]
+ -  Added `ICryptoBackend` class.  [[#758]]
+ -  Added `DefaultCryptoBackend` class.  [[#758]]
+ -  Added `Swarm<T>.BroadcastBlock(Block<T>)` method.  [[#764]]
+ -  Added `Swarm<T>.PeerStates` property.  [[#772]]
+ -  Added `PeerState` class which represents a `Peer`s state in the
+    routing table.  [[#772]]
+ -  Added `Swarm<T>.CheckAllPeersAsync()` method.  [[#772]]
 
 ### Behavioral changes
 
@@ -94,6 +326,17 @@ To be released.
     relaying proxy concurrently.  [[#744]]
  -  `Swarm<T>` became to throw `InvalidGenesisBlockException` when receiving
     block from the nodes that have a different genesis block.  [[#746]]
+ -  `Swarm<T>` became to distinguish the starting stages clearly.  In other words,
+    `Swarm<T>.StartAsync()` became not to call `Swarm<T>.PreloadAsync()`.  [[#735], [#760]]
+ -  The hash of `Block<T>` has changed due to the change in the method of
+    serialization.  [[#762]]
+ -  `Swarm<T>` became to ignore broadcasted block that has lower index than
+    the current tip.  [[#764]]
+ -  The way `Swarm<T>` chose peers to spread messages has changed.  [[#765], [#767]]
+     -  If there are less than 10 peers in the routing table, select all peers.
+     -  If there are more than 10 peers in the routing table,
+        choose one from each bucket, and if the number is less than 10,
+        then select an additional peers so that the total is 10.
 
 ### Bug fixes
 
@@ -126,7 +369,18 @@ To be released.
     [[#744]]
  -  Fixed a bug where `Swarm<T>` had failed to request a TURN relay when it has
     an IPv6 address.  [[#744]]
+ -  Fixed a bug where `DefaultStore` had invalid state references cache after fork.
+    [[#759]]
+ -  Fixed a bug where `BlockChain<T>` had rendered and evaluated actions in
+    the genesis block during forking.  [[#763]]
+ -  Fixed a `Swam<T>`'s bug that some `Transaction<T>`s had become excluded from
+    mining `Block<T>`s after reorg from α to β where a `Transaction<T>` was once
+    included by a `Block<T>` (α) and not included by an other `Block<T>` (β) for
+    the same `Index` due to the latency gap between nodes.  [[#775]]
+ -  Fixed a bug where `TransactionSet` and `BlockSet` has halt whole process when
+    run `Trace.Assert()` [[#806], [#833]]
 
+[#368]: https://github.com/planetarium/libplanet/issues/368
 [#570]: https://github.com/planetarium/libplanet/issues/570
 [#580]: https://github.com/planetarium/libplanet/pull/580
 [#604]: https://github.com/planetarium/libplanet/issues/604
@@ -159,10 +413,28 @@ To be released.
 [#728]: https://github.com/planetarium/libplanet/pull/728
 [#732]: https://github.com/planetarium/libplanet/pull/732
 [#734]: https://github.com/planetarium/libplanet/pull/734
+[#735]: https://github.com/planetarium/libplanet/issues/735
 [#736]: https://github.com/planetarium/libplanet/pull/736
 [#739]: https://github.com/planetarium/libplanet/pull/739
 [#744]: https://github.com/planetarium/libplanet/pull/744
 [#746]: https://github.com/planetarium/libplanet/pull/746
+[#749]: https://github.com/planetarium/libplanet/issues/749
+[#751]: https://github.com/planetarium/libplanet/pull/751
+[#753]: https://github.com/planetarium/libplanet/pull/753
+[#757]: https://github.com/planetarium/libplanet/pull/757
+[#758]: https://github.com/planetarium/libplanet/pull/758
+[#759]: https://github.com/planetarium/libplanet/pull/759
+[#760]: https://github.com/planetarium/libplanet/pull/760
+[#762]: https://github.com/planetarium/libplanet/pull/762
+[#763]: https://github.com/planetarium/libplanet/pull/763
+[#764]: https://github.com/planetarium/libplanet/pull/764
+[#765]: https://github.com/planetarium/libplanet/issues/765
+[#767]: https://github.com/planetarium/libplanet/pull/767
+[#772]: https://github.com/planetarium/libplanet/pull/772
+[#774]: https://github.com/planetarium/libplanet/pull/774
+[#775]: https://github.com/planetarium/libplanet/pull/775
+[#806]: https://github.com/planetarium/libplanet/issues/806
+[#833]: https://github.com/planetarium/libplanet/pull/833
 
 
 Version 0.7.0
@@ -204,9 +476,9 @@ Released on November 8, 2019.
      -  Removed `BlockChain<T>.GetEnumerate()` method.  [[#630]]
      -  Removed `BlockPolicyExtension.ValidateBlocks()` method.  [[#630]]
      -  `IBlockPolicy<T>.GetNextBlockDifficulty()` method became to receive
-        `BlockChain<T>` instead of `IReadOnlyList<Block<<T>>`.  [[#630]]
+        `BlockChain<T>` instead of `IReadOnlyList<Block<T>>`.  [[#630]]
      -  `IBlockPolicy<T>.ValidateNextBlock()` method became to receive
-        `BlockChain<T>` instead of `IReadOnlyList<Block<<T>>`.  [[#630]]
+        `BlockChain<T>` instead of `IReadOnlyList<Block<T>>`.  [[#630]]
 
 ### Added interfaces
 
@@ -894,9 +1166,9 @@ Released on May 31, 2019.
  -  Added `IAction.Unrender(IActionContext, IAccountStateDelta)` method.
     [[#31], [#212]]
  -  `BlockChain<T>.Validate()` method became to receive
-    `IReadOnlyList<Block<<T>>` instead of `IEnumerable<Block<T>>`.  [[#205]]
+    `IReadOnlyList<Block<T>>` instead of `IEnumerable<Block<T>>`.  [[#205]]
  -  `IBlockPolicy<T>.GetNextBlockDifficulty()` method became to receive
-    `IReadOnlyList<Block<<T>>` instead of `IEnumerable<Block<T>>`.  [[#205]]
+    `IReadOnlyList<Block<T>>` instead of `IEnumerable<Block<T>>`.  [[#205]]
  -  Added
     `IBlockPolicy<T>.ValidateNextBlock(IReadOnlyList<Block<T>>, Block<T>)`
     method.  [[#210]]
@@ -1264,6 +1536,7 @@ Released on April 5, 2019.
  -  `BencodexFormatter` became able to serialize `BigInteger`.  [[#159]]
  -  Made `Swarm` possible to configure its network `appProtocolVersion` and,
     to ignore peers if their version is different.  [[#167]], [[#170]]
+ -  Added `DifferentAppProtocolVersionException` class.  [[#167], [#170]]
  -  Added `IActionContext.Miner` property.  [[#173]], [[#174]]
  -  Renamed `Block<T>.RewardBeneficiary` to `Block<T>.Miner`.  [[#174]]
  -  Added `BlockChain<T>.Blocks` property.  [[#176]]

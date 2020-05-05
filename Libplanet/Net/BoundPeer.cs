@@ -22,7 +22,7 @@ namespace Libplanet.Net
         public BoundPeer(
             PublicKey publicKey,
             DnsEndPoint endPoint,
-            int appProtocolVersion)
+            AppProtocolVersion appProtocolVersion)
         : this(publicKey, endPoint, appProtocolVersion, null)
         {
         }
@@ -30,7 +30,7 @@ namespace Libplanet.Net
         internal BoundPeer(
             PublicKey publicKey,
             DnsEndPoint endPoint,
-            int appProtocolVersion,
+            AppProtocolVersion appProtocolVersion,
             IPAddress publicIPAddress)
         : base(publicKey, appProtocolVersion, publicIPAddress)
         {
@@ -50,6 +50,12 @@ namespace Libplanet.Net
         /// </summary>
         [Pure]
         public DnsEndPoint EndPoint { get; }
+
+        public static bool operator ==(BoundPeer left, BoundPeer right) =>
+            Operator.Weave(left, right);
+
+        public static bool operator !=(BoundPeer left, BoundPeer right) =>
+            Operator.Weave(left, right);
 
         /// <inheritdoc/>
         public override void GetObjectData(

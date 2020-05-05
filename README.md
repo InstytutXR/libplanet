@@ -13,6 +13,23 @@ peer-to-peer network among equal nodes rather than an authorized central
 server.  Under the hood, it incorporates many features (e.g.,
 [digital signature], [BFT] consensus, data replication) of a [blockchain].
 
+It has competitive advantages over other solutions for decentralized gaming:
+
+ -  *Embeddable*: A game app does not have to communicate with another running
+    process, hence it doesn't require extra marshaling or processes management.
+    To draw a parallel, Libplanet is closer to SQLite than MySQL or PostgreSQL.
+
+ -  *Isomorphic*: Libplanet is a .NET library, so every game logic can be
+    written in the same language, C#, and run on the blockchain. No glue
+    code or "smart contracts" are needed.
+
+ -  *Token-independent*: Unlike almost every blockchain system, it does not
+    force users to create and deal with yet-another-cryptocurrency. Your
+    game can be free to play, and enjoyed by regular gamers.
+
+To learn more about why Planetarium is creating technology for fully
+decentralized games, please refer to our [blog post].
+
 [Discord]: https://discord.gg/planetarium
 [Azure Pipelines]: https://dev.azure.com/planetarium/libplanet/_build/latest?definitionId=1&branchName=master
 [Codecov]: https://codecov.io/gh/planetarium/libplanet
@@ -20,6 +37,7 @@ server.  Under the hood, it incorporates many features (e.g.,
 [digital signature]: https://en.wikipedia.org/wiki/Digital_signature
 [BFT]: https://en.wikipedia.org/wiki/Byzantine_fault_tolerance
 [blockchain]: https://en.wikipedia.org/wiki/Blockchain
+[blog post]: https://medium.com/planetarium/introducing-planetarium-powering-games-with-freedom-22ab1ab70e0e
 
 
 NuGet
@@ -56,10 +74,11 @@ To use Libplanet on Unity, you need to manually extract *Libplanet.dll*
 from *Libplanet.\*.nupkg* file and place it inside of your Unity project.
 We are acknowledging the fact Libplanet is currently not very usable together
 with Unity, and promise to make it better in the next few minor releases.
-In the near future, we are going to submit it to [Unity Asset Store] too.
+Until then, you could try [MSBuildForUnity] which is experimental as of
+January 2020.
 
 [releases]: https://github.com/planetarium/libplanet/releases
-[Unity Asset Store]: https://assetstore.unity.com/
+[MSBuildForUnity]: https://github.com/microsoft/MSBuildForUnity
 [1]: https://docs.microsoft.com/nuget/consume-packages/ways-to-install-a-package
 
 

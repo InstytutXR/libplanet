@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,8 +15,6 @@ using Libplanet.Store;
 using Libplanet.Tx;
 using Serilog;
 
-[assembly: InternalsVisibleTo("Libplanet.Tests")]
-[assembly: InternalsVisibleTo("Libplanet.Benchmarks")]
 namespace Libplanet.Blockchain
 {
     /// <summary>
@@ -88,7 +85,25 @@ namespace Libplanet.Blockchain
             IBlockPolicy<T> policy,
             IStore store,
             Guid id,
-            Block<T> genesisBlock)
+            Block<T> genesisBlock
+        )
+            : this(
+                policy,
+                store,
+                id,
+                genesisBlock,
+                false
+            )
+        {
+        }
+
+        private BlockChain(
+            IBlockPolicy<T> policy,
+            IStore store,
+            Guid id,
+            Block<T> genesisBlock,
+            bool inFork
+        )
         {
             Id = id;
             Policy = policy;
@@ -109,7 +124,12 @@ namespace Libplanet.Blockchain
 
             if (Count == 0)
             {
-                Append(genesisBlock);
+                Append(
+                    genesisBlock,
+                    currentTime: genesisBlock.Timestamp,
+                    renderActions: !inFork,
+                    evaluateActions: !inFork
+                );
             }
             else if (!Genesis.Equals(genesisBlock))
             {
@@ -271,7 +291,7 @@ namespace Libplanet.Blockchain
             return Block<T>.Mine(
                 0,
                 0,
-                privateKey.PublicKey.ToAddress(),
+                privateKey.ToAddress(),
                 null,
                 timestamp ?? DateTimeOffset.UtcNow,
                 new[] { Transaction<T>.Create(0, privateKey, actions, timestamp: timestamp), });
@@ -378,11 +398,12 @@ namespace Libplanet.Blockchain
 
             Block<T> block = this[offset.Value];
             Tuple<HashDigest<SHA256>, long> stateReference;
+            string stateKey = address.ToHex().ToLowerInvariant();
 
             _rwlock.EnterReadLock();
             try
             {
-                stateReference = Store.LookupStateReference(Id, address, block);
+                stateReference = Store.LookupStateReference(Id, stateKey, block);
             }
             finally
             {
@@ -396,7 +417,7 @@ namespace Libplanet.Blockchain
 
             HashDigest<SHA256> hashValue = stateReference.Item1;
 
-            IImmutableDictionary<Address, IValue> blockStates = Store.GetBlockStates(hashValue);
+            IImmutableDictionary<string, IValue> blockStates = Store.GetBlockStates(hashValue);
             if (blockStates is null)
             {
                 if (completeStates)
@@ -437,7 +458,7 @@ namespace Libplanet.Blockchain
                 }
             }
 
-            if (blockStates.TryGetValue(address, out IValue state))
+            if (blockStates.TryGetValue(stateKey, out IValue state))
             {
                 return state;
             }
@@ -487,29 +508,27 @@ namespace Libplanet.Blockchain
             Append(block, currentTime, evaluateActions: true, renderActions: true);
 
         /// <summary>
-        /// Adds <paramref name="transactions"/> to the pending list so that
-        /// a next <see cref="Block{T}"/> to be mined contains these
-        /// <paramref name="transactions"/>.
+        /// Adds a <paramref name="transaction"/> to the pending list so that
+        /// a next <see cref="Block{T}"/> to be mined contains the given
+        /// <paramref name="transaction"/>.
         /// </summary>
-        /// <param name="transactions"><see cref="Transaction{T}"/>s to add to the pending list.
+        /// <param name="transaction"><see cref="Transaction{T}"/> to add to the pending list.
         /// </param>
-        public void StageTransactions(IImmutableSet<Transaction<T>> transactions)
+        /// <exception cref="InvalidTxException">Thrown when the given
+        /// <paramref name="transaction"/> is invalid.</exception>
+        public void StageTransaction(Transaction<T> transaction)
         {
+            // FIXME it's global chain lock so using it in this method can cause degrading
+            // parallelism of `BlockChain<T>`. we should re-organize locks in `BlockChain<T>`
             _rwlock.EnterWriteLock();
 
             try
             {
-                // FIXME: We need to create a separate pool to handle transactions.
-                transactions = transactions
-                    .Where(tx => !_transactions.ContainsKey(tx.Id))
-                    .ToImmutableHashSet();
-
-                foreach (Transaction<T> tx in transactions)
+                if (!_transactions.ContainsKey(transaction.Id))
                 {
-                    _transactions[tx.Id] = tx;
+                    _transactions[transaction.Id] = transaction;
+                    Store.StageTransactionIds(ImmutableHashSet.Create(transaction.Id));
                 }
-
-                Store.StageTransactionIds(transactions.Select(tx => tx.Id).ToImmutableHashSet());
             }
             finally
             {
@@ -518,19 +537,20 @@ namespace Libplanet.Blockchain
         }
 
         /// <summary>
-        /// Removes <paramref name="transactions"/> from the pending list.
+        /// Removes a <paramref name="transaction"/> from the pending list.
         /// </summary>
-        /// <param name="transactions"><see cref="Transaction{T}"/>s
+        /// <param name="transaction">A <see cref="Transaction{T}"/>
         /// to remove from the pending list.</param>
-        /// <seealso cref="StageTransactions"/>
-        public void UnstageTransactions(ISet<Transaction<T>> transactions)
+        /// <seealso cref="StageTransaction"/>
+        public void UnstageTransaction(Transaction<T> transaction)
         {
+            // FIXME it's global chain lock so using it in this method can cause degrading
+            // parallelism of `BlockChain<T>`. we should re-organize locks in `BlockChain<T>`
             _rwlock.EnterWriteLock();
 
             try
             {
-                Store.UnstageTransactionIds(
-                    transactions.Select(tx => tx.Id).ToImmutableHashSet());
+                Store.UnstageTransactionIds(ImmutableHashSet.Create(transaction.Id));
             }
             finally
             {
@@ -598,10 +618,24 @@ namespace Libplanet.Blockchain
             long index = Store.CountIndex(Id);
             long difficulty = Policy.GetNextBlockDifficulty(this);
             HashDigest<SHA256>? prevHash = Store.IndexBlockHash(Id, index - 1);
-            IEnumerable<Transaction<T>> transactions = Store
+            IEnumerable<Transaction<T>> stagedTransactions = Store
                 .IterateStagedTransactionIds()
-                .Select(Store.GetTransaction<T>)
-                .Where(tx => tx.Nonce < GetNextTxNonce(tx.Signer));
+                .Select(Store.GetTransaction<T>);
+
+            var transactionsToMine = new List<Transaction<T>>();
+
+            foreach (Transaction<T> tx in stagedTransactions)
+            {
+                if (!Policy.DoesTransactionFollowsPolicy(tx))
+                {
+                    UnstageTransaction(tx);
+                }
+                else if (Store.GetTxNonce(Id, tx.Signer) <= tx.Nonce
+                         && tx.Nonce < GetNextTxNonce(tx.Signer))
+                {
+                    transactionsToMine.Add(tx);
+                }
+            }
 
             CancellationTokenSource cts = new CancellationTokenSource();
             CancellationTokenSource cancellationTokenSource =
@@ -624,7 +658,7 @@ namespace Libplanet.Blockchain
                         miner: miner,
                         previousHash: prevHash,
                         timestamp: currentTime,
-                        transactions: transactions,
+                        transactions: transactionsToMine,
                         cancellationToken: cancellationTokenSource.Token),
                     cancellationTokenSource.Token
                 );
@@ -676,12 +710,12 @@ namespace Libplanet.Blockchain
             lock (_txLock)
             {
                 Transaction<T> tx = Transaction<T>.Create(
-                    GetNextTxNonce(privateKey.PublicKey.ToAddress()),
+                    GetNextTxNonce(privateKey.ToAddress()),
                     privateKey,
                     actions,
                     updatedAddresses,
                     timestamp);
-                StageTransactions(ImmutableHashSet<Transaction<T>>.Empty.Add(tx));
+                StageTransaction(tx);
 
                 return tx;
             }
@@ -724,6 +758,13 @@ namespace Libplanet.Blockchain
                 // the tx nounce order when the block was created
                 foreach (Transaction<T> tx1 in block.Transactions)
                 {
+                    if (!Policy.DoesTransactionFollowsPolicy(tx1))
+                    {
+                        throw new TxViolatingBlockPolicyException(
+                            tx1.Id,
+                            "According to BlockPolicy, this transaction is not valid.");
+                    }
+
                     Address txSigner = tx1.Signer;
                     nonceDeltas.TryGetValue(txSigner, out var nonceDelta);
 
@@ -766,7 +807,6 @@ namespace Libplanet.Blockchain
                         Index = block.Index,
                         Hash = block.Hash,
                     };
-                    TipChanged?.Invoke(this, tipChangedEventArgs);
 
                     _logger.Debug("Unstaging transactions...");
 
@@ -788,6 +828,7 @@ namespace Libplanet.Blockchain
                         .Select(tx => tx.Id)
                         .ToImmutableHashSet();
                     Store.UnstageTransactionIds(txIds);
+                    TipChanged?.Invoke(this, tipChangedEventArgs);
                     _logger.Debug("Block {blockIndex}: {block} is appended.", block?.Index, block);
                 }
                 finally
@@ -958,7 +999,7 @@ namespace Libplanet.Blockchain
             }
         }
 
-        internal IEnumerable<HashDigest<SHA256>> FindNextHashes(
+        internal Tuple<long?, IReadOnlyList<HashDigest<SHA256>>> FindNextHashes(
             BlockLocator locator,
             HashDigest<SHA256>? stop = null,
             int count = 500)
@@ -970,7 +1011,10 @@ namespace Libplanet.Blockchain
                 HashDigest<SHA256>? tip = Store.IndexBlockHash(Id, -1);
                 if (tip is null)
                 {
-                    yield break;
+                    return new Tuple<long?, IReadOnlyList<HashDigest<SHA256>>>(
+                        null,
+                        new HashDigest<SHA256>[0]
+                    );
                 }
 
                 HashDigest<SHA256>? branchPoint = FindBranchPoint(locator);
@@ -991,22 +1035,28 @@ namespace Libplanet.Blockchain
                 IEnumerable<HashDigest<SHA256>> hashes = Store
                     .IterateIndexes(Id, branchPointIndex, count);
 
+                var result = new List<HashDigest<SHA256>>();
                 foreach (HashDigest<SHA256> hash in hashes)
                 {
                     if (count == 0)
                     {
-                        yield break;
+                        break;
                     }
 
-                    yield return hash;
+                    result.Add(hash);
 
                     if (hash.Equals(stop))
                     {
-                        yield break;
+                        break;
                     }
 
                     count--;
                 }
+
+                return new Tuple<long?, IReadOnlyList<HashDigest<SHA256>>>(
+                    branchPointIndex,
+                    result
+                );
             }
             finally
             {
@@ -1032,7 +1082,7 @@ namespace Libplanet.Blockchain
                     nameof(point));
             }
 
-            var forked = new BlockChain<T>(Policy, Store, Guid.NewGuid(), Genesis);
+            var forked = new BlockChain<T>(Policy, Store, Guid.NewGuid(), Genesis, true);
             Guid forkedId = forked.Id;
             _logger.Debug(
                 "Trying to fork chain at {branchPoint}" +
@@ -1108,30 +1158,11 @@ namespace Libplanet.Blockchain
             {
                 _rwlock.EnterReadLock();
 
-                HashDigest<SHA256>? current = Store.IndexBlockHash(Id, -1);
-                long step = 1;
-                var hashes = new List<HashDigest<SHA256>>();
-
-                while (current is HashDigest<SHA256> hash)
-                {
-                    hashes.Add(hash);
-                    Block<T> currentBlock = _blocks[hash];
-
-                    if (currentBlock.Index == 0)
-                    {
-                        break;
-                    }
-
-                    long nextIndex = Math.Max(currentBlock.Index - step, 0);
-                    current = Store.IndexBlockHash(Id, nextIndex);
-
-                    if (hashes.Count > threshold)
-                    {
-                        step *= 2;
-                    }
-                }
-
-                return new BlockLocator(hashes);
+                return new BlockLocator(
+                    indexBlockHash: idx => Store.IndexBlockHash(Id, idx),
+                    indexByBlockHash: hash => _blocks[hash].Index,
+                    sampleAfter: threshold
+                );
             }
             finally
             {
@@ -1147,8 +1178,8 @@ namespace Libplanet.Blockchain
             if (other?.Tip is null)
             {
                 throw new ArgumentException(
-                        $"The chain to be swapped is invalid. Id: {other?.Id}, Tip: {other?.Tip}",
-                        nameof(other));
+                    $"The chain to be swapped is invalid. Id: {other?.Id}, Tip: {other?.Tip}",
+                    nameof(other));
             }
 
             _logger.Debug(
@@ -1156,20 +1187,28 @@ namespace Libplanet.Blockchain
 
             // Finds the branch point.
             Block<T> topmostCommon = null;
-            if (render && !(Tip is null))
+            if (!(Tip is null))
             {
                 long shorterHeight =
                     Math.Min(Count, other.Count) - 1;
-                for (
-                    Block<T> t = this[shorterHeight], o = other[shorterHeight];
-                    t.PreviousHash is HashDigest<SHA256> tp &&
-                        o.PreviousHash is HashDigest<SHA256> op;
-                    t = this[tp], o = other[op]
-                )
+                Block<T> t = this[shorterHeight], o = other[shorterHeight];
+
+                while (true)
                 {
                     if (t.Equals(o))
                     {
                         topmostCommon = t;
+                        break;
+                    }
+
+                    if (t.PreviousHash is HashDigest<SHA256> tp &&
+                        o.PreviousHash is HashDigest<SHA256> op)
+                    {
+                        t = this[tp];
+                        o = other[op];
+                    }
+                    else
+                    {
                         break;
                     }
                 }
@@ -1186,7 +1225,7 @@ namespace Libplanet.Blockchain
                 for (
                     Block<T> b = Tip;
                     !(b is null) && b.Index > (topmostCommon?.Index ?? -1) &&
-                        b.PreviousHash is HashDigest<SHA256> ph;
+                    b.PreviousHash is HashDigest<SHA256> ph;
                     b = this[ph]
                 )
                 {
@@ -1205,6 +1244,19 @@ namespace Libplanet.Blockchain
 
                 _logger.Debug($"Unrender for {nameof(Swap)}() is completed.");
             }
+
+            IEnumerable<TxId> GetTxIdsWithRange(BlockChain<T> chain, Block<T> start, Block<T> end)
+                => Enumerable
+                    .Range((int)start.Index + 1, (int)(end.Index - start.Index))
+                    .SelectMany(x => chain[x].Transactions.Select(tx => tx.Id));
+
+            // It assumes reorg is small size. If it was big, this may be heavy task.
+            ImmutableHashSet<TxId> unstagedTxIds =
+                GetTxIdsWithRange(this, topmostCommon, Tip).ToImmutableHashSet();
+            ImmutableHashSet<TxId> stageTxIds =
+                GetTxIdsWithRange(other, topmostCommon, other.Tip).ToImmutableHashSet();
+            ImmutableHashSet<TxId> restageTxIds = unstagedTxIds.Except(stageTxIds);
+            Store.StageTransactionIds(restageTxIds);
 
             try
             {
@@ -1264,11 +1316,11 @@ namespace Libplanet.Blockchain
             bool buildStateReferences
         )
         {
-            ImmutableHashSet<Address> updatedAddresses =
+            ImmutableHashSet<string> updatedAddresses =
                 actionEvaluations.Select(
-                    a => a.OutputStates.UpdatedAddresses
+                    a => a.OutputStates.UpdatedAddresses.Select(ad => ad.ToHex().ToLowerInvariant())
                 ).Aggregate(
-                    ImmutableHashSet<Address>.Empty,
+                    ImmutableHashSet<string>.Empty,
                     (a, b) => a.Union(b)
                 );
 
@@ -1278,13 +1330,11 @@ namespace Libplanet.Blockchain
                 IAccountStateDelta lastStates = actionEvaluations.Count > 0
                     ? actionEvaluations[actionEvaluations.Count - 1].OutputStates
                     : null;
-                ImmutableDictionary<Address, IValue> totalDelta =
-                    updatedAddresses.Select(
-                        a => new KeyValuePair<Address, IValue>(
-                            a,
-                            lastStates?.GetState(a)
-                        )
-                    ).ToImmutableDictionary();
+                ImmutableDictionary<string, IValue> totalDelta =
+                    updatedAddresses.ToImmutableDictionary(
+                        a => a,
+                        a => lastStates?.GetState(new Address(a))
+                    );
 
                 Store.SetBlockStates(blockHash, totalDelta);
             }

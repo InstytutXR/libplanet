@@ -11,7 +11,7 @@ using Libplanet.Tx;
 
 namespace Libplanet.Store
 {
-    public abstract class BaseStore : IStore
+    public abstract class BaseStore : IStore, IDisposable
     {
         /// <inheritdoc />
         public abstract IEnumerable<Guid> ListChainIds();
@@ -43,10 +43,10 @@ namespace Libplanet.Store
             HashDigest<SHA256> branchPoint);
 
         /// <inheritdoc />
-        public abstract IEnumerable<Address> ListAddresses(Guid chainId);
+        public abstract IEnumerable<string> ListStateKeys(Guid chainId);
 
         /// <inheritdoc/>
-        public abstract IImmutableDictionary<Address, IImmutableList<HashDigest<SHA256>>>
+        public abstract IImmutableDictionary<string, IImmutableList<HashDigest<SHA256>>>
             ListAllStateReferences(
                 Guid chainId,
                 long lowestIndex = 0,
@@ -78,25 +78,24 @@ namespace Libplanet.Store
         public Block<T> GetBlock<T>(HashDigest<SHA256> blockHash)
             where T : IAction, new()
         {
-            if (GetRawBlock(blockHash) is RawBlock rawBlock)
+            if (GetBlockDigest(blockHash) is BlockDigest blockDigest)
             {
-                HashDigest<SHA256>? prevHash = rawBlock.PreviousHash is byte[] h
-                    ? new HashDigest<SHA256>(h)
+                HashDigest<SHA256>? prevHash = blockDigest.Header.PreviousHash.Any()
+                    ? new HashDigest<SHA256>(blockDigest.Header.PreviousHash.ToArray())
                     : (HashDigest<SHA256>?)null;
                 return new Block<T>(
-                    index: rawBlock.Index,
-                    difficulty: rawBlock.Difficulty,
-                    nonce: new Nonce(rawBlock.Nonce),
-                    miner: new Address(rawBlock.Miner),
+                    index: blockDigest.Header.Index,
+                    difficulty: blockDigest.Header.Difficulty,
+                    nonce: new Nonce(blockDigest.Header.Nonce.ToArray()),
+                    miner: new Address(blockDigest.Header.Miner),
                     previousHash: prevHash,
                     timestamp: DateTimeOffset.ParseExact(
-                        rawBlock.Timestamp,
+                        blockDigest.Header.Timestamp,
                         Block<T>.TimestampFormat,
                         CultureInfo.InvariantCulture
                     ).ToUniversalTime(),
-                    transactions: rawBlock.Transactions
-                        .Cast<byte[]>()
-                        .Select(bytes => GetTransaction<T>(new TxId(bytes)))
+                    transactions: blockDigest.TxIds
+                        .Select(bytes => GetTransaction<T>(new TxId(bytes.ToArray())))
                 );
             }
 
@@ -106,8 +105,11 @@ namespace Libplanet.Store
         /// <inheritdoc/>
         public long? GetBlockIndex(HashDigest<SHA256> blockHash)
         {
-            return GetRawBlock(blockHash)?.Index;
+            return GetBlockDigest(blockHash)?.Header.Index;
         }
+
+        /// <inheritdoc/>
+        public abstract BlockDigest? GetBlockDigest(HashDigest<SHA256> blockHash);
 
         /// <inheritdoc />
         public abstract void PutBlock<T>(Block<T> block)
@@ -118,33 +120,40 @@ namespace Libplanet.Store
         /// <inheritdoc />
         public abstract bool ContainsBlock(HashDigest<SHA256> blockHash);
 
-        public abstract IImmutableDictionary<Address, IValue> GetBlockStates(
+        public abstract IImmutableDictionary<string, IValue> GetBlockStates(
             HashDigest<SHA256> blockHash
         );
 
+        /// <inheritdoc />
         public abstract void SetBlockStates(
             HashDigest<SHA256> blockHash,
-            IImmutableDictionary<Address, IValue> states
+            IImmutableDictionary<string, IValue> states
         );
+
+        /// <inheritdoc />
+        public abstract void PruneBlockStates<T>(
+            Guid chainId,
+            Block<T> until)
+            where T : IAction, new();
 
         /// <inheritdoc />
         public abstract Tuple<HashDigest<SHA256>, long> LookupStateReference<T>(
             Guid chainId,
-            Address address,
+            string key,
             Block<T> lookupUntil)
             where T : IAction, new();
 
         /// <inheritdoc />
         public abstract IEnumerable<Tuple<HashDigest<SHA256>, long>> IterateStateReferences(
             Guid chainId,
-            Address address,
+            string key,
             long? highestIndex,
             long? lowestIndex,
             int? limit);
 
         public abstract void StoreStateReference(
             Guid chainId,
-            IImmutableSet<Address> addresses,
+            IImmutableSet<string> keys,
             HashDigest<SHA256> blockHash,
             long blockIndex);
 
@@ -174,14 +183,13 @@ namespace Libplanet.Store
             return IterateBlockHashes().LongCount();
         }
 
-        public abstract bool DeleteIndex(Guid chainId, HashDigest<SHA256> hash);
-
         /// <inheritdoc />
         public abstract bool ContainsTransaction(TxId txId);
 
         /// <inheritdoc/>
         public abstract void DeleteChainId(Guid chainId);
 
-        internal abstract RawBlock? GetRawBlock(HashDigest<SHA256> blockHash);
+        /// <inheritdoc/>
+        public abstract void Dispose();
     }
 }

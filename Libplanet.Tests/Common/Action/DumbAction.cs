@@ -40,6 +40,9 @@ namespace Libplanet.Tests.Common.Action
             RenderRecords { get; } =
                 new AsyncLocal<ImmutableList<RenderRecord>>();
 
+        public static AsyncLocal<ImmutableList<ExecuteRecord>>
+            ExecuteRecords { get; } = new AsyncLocal<ImmutableList<ExecuteRecord>>();
+
         public static AsyncLocal<ImmutableList<(Address, string)>>
             RehearsalRecords { get; } =
                 new AsyncLocal<ImmutableList<(Address, string)>>();
@@ -68,18 +71,12 @@ namespace Libplanet.Tests.Common.Action
                 {
                     // In order to avoid changing tx signatures in many test
                     // fixtures, adds field only if RecordRandom = true.
-                    plainValue =
-                        (Dictionary)plainValue.Add(
-                            (Text)"record_random",
-                            new Bencodex.Types.Boolean(true));
+                    plainValue = plainValue.Add("record_random", true);
                 }
 
                 if (Idempotent)
                 {
-                    plainValue =
-                        (Dictionary)plainValue.Add(
-                            (Text)"idempotent",
-                            new Bencodex.Types.Boolean(Idempotent));
+                    plainValue = plainValue.Add("idempotent", Idempotent);
                 }
 
                 return plainValue;
@@ -137,7 +134,21 @@ namespace Libplanet.Tests.Common.Action
                 );
             }
 
-            return states.SetState(TargetAddress, (Text)items);
+            IAccountStateDelta nextState = states.SetState(TargetAddress, (Text)items);
+
+            if (ExecuteRecords.Value is null)
+            {
+                ExecuteRecords.Value = ImmutableList<ExecuteRecord>.Empty;
+            }
+
+            ExecuteRecords.Value = ExecuteRecords.Value.Add(new ExecuteRecord()
+            {
+                Action = this,
+                NextState = nextState,
+                Rehearsal = context.Rehearsal,
+            });
+
+            return nextState;
         }
 
         public void Render(
@@ -192,7 +203,7 @@ namespace Libplanet.Tests.Common.Action
             RecordRehearsal = plainValue.GetValue<Boolean>("record_rehearsal").Value;
             RecordRandom =
                 plainValue.ContainsKey((Text)"record_random") &&
-                plainValue[(Text)"record_random"] is Boolean r &&
+                plainValue["record_random"] is Boolean r &&
                 r.Value;
 
             if (plainValue.ContainsKey((Text)"idempotent"))

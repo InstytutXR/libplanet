@@ -63,19 +63,13 @@ namespace Libplanet.Tests.Store
             return _store.ContainsBlock(blockHash);
         }
 
-        public bool DeleteIndex(Guid chainId, HashDigest<SHA256> hash)
+        public IEnumerable<string> ListStateKeys(Guid chainId)
         {
-            Log(nameof(DeleteIndex), chainId, hash);
-            return _store.DeleteIndex(chainId, hash);
+            Log(nameof(ListStateKeys), chainId);
+            return _store.ListStateKeys(chainId);
         }
 
-        public IEnumerable<Address> ListAddresses(Guid chainId)
-        {
-            Log(nameof(ListAddresses), chainId);
-            return _store.ListAddresses(chainId);
-        }
-
-        public IImmutableDictionary<Address, IImmutableList<HashDigest<SHA256>>>
+        public IImmutableDictionary<string, IImmutableList<HashDigest<SHA256>>>
             ListAllStateReferences(
                 Guid chainId,
                 long lowestIndex,
@@ -110,7 +104,13 @@ namespace Libplanet.Tests.Store
             return _store.GetBlockIndex(blockHash);
         }
 
-        public IImmutableDictionary<Address, IValue> GetBlockStates(HashDigest<SHA256> blockHash)
+        public BlockDigest? GetBlockDigest(HashDigest<SHA256> blockHash)
+        {
+            Log(nameof(GetBlockDigest), blockHash);
+            return _store.GetBlockDigest(blockHash);
+        }
+
+        public IImmutableDictionary<string, IValue> GetBlockStates(HashDigest<SHA256> blockHash)
         {
             Log(nameof(GetBlockStates), blockHash);
             return _store.GetBlockStates(blockHash);
@@ -181,26 +181,35 @@ namespace Libplanet.Tests.Store
 
         public void SetBlockStates(
             HashDigest<SHA256> blockHash,
-            IImmutableDictionary<Address, IValue> states
+            IImmutableDictionary<string, IValue> states
         )
         {
             Log(nameof(SetBlockStates), blockHash, states);
             _store.SetBlockStates(blockHash, states);
         }
 
+        public void PruneBlockStates<T>(
+            Guid chainId,
+            Block<T> until)
+            where T : IAction, new()
+        {
+            Log(nameof(PruneBlockStates), chainId, until);
+            _store.PruneBlockStates(chainId, until);
+        }
+
         public Tuple<HashDigest<SHA256>, long> LookupStateReference<T>(
             Guid chainId,
-            Address address,
+            string key,
             Block<T> lookupUntil)
             where T : IAction, new()
         {
-            Log(nameof(LookupStateReference), chainId, address, lookupUntil);
-            return _store.LookupStateReference(chainId, address, lookupUntil);
+            Log(nameof(LookupStateReference), chainId, key, lookupUntil);
+            return _store.LookupStateReference(chainId, key, lookupUntil);
         }
 
         public IEnumerable<Tuple<HashDigest<SHA256>, long>> IterateStateReferences(
             Guid chainId,
-            Address address,
+            string key,
             long? highestIndex,
             long? lowestIndex,
             int? limit)
@@ -208,22 +217,22 @@ namespace Libplanet.Tests.Store
             Log(
                 nameof(IterateStateReferences),
                 chainId,
-                address,
+                key,
                 highestIndex,
                 lowestIndex,
                 limit);
             return _store.IterateStateReferences(
-                chainId, address, highestIndex, lowestIndex, limit);
+                chainId, key, highestIndex, lowestIndex, limit);
         }
 
         public void StoreStateReference(
             Guid chainId,
-            IImmutableSet<Address> addresses,
+            IImmutableSet<string> keys,
             HashDigest<SHA256> blockHash,
             long blockIndex)
         {
-            Log(nameof(StoreStateReference), chainId, addresses, blockHash, blockIndex);
-            _store.StoreStateReference(chainId, addresses, blockHash, blockIndex);
+            Log(nameof(StoreStateReference), chainId, keys, blockHash, blockIndex);
+            _store.StoreStateReference(chainId, keys, blockHash, blockIndex);
         }
 
         public void ForkStateReferences<T>(

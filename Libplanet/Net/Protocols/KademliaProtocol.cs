@@ -5,6 +5,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Libplanet.Crypto;
 using Libplanet.Net.Messages;
 using Serilog;
 using Random = System.Random;
@@ -14,9 +15,13 @@ namespace Libplanet.Net.Protocols
     internal class KademliaProtocol : IProtocol
     {
         private readonly TimeSpan _requestTimeout;
-        private readonly ISwarm _swarm;
+        private readonly ITransport _transport;
         private readonly Address _address;
-        private readonly int _appProtocolVersion;
+        private readonly AppProtocolVersion _appProtocolVersion;
+        private readonly IImmutableSet<PublicKey> _trustedAppProtocolVersionSigners;
+        private readonly DifferentAppProtocolVersionEncountered
+            _differentAppProtocolVersionEncountered;
+
         private readonly Random _random;
         private readonly RoutingTable _routing;
         private readonly int _tableSize;
@@ -25,16 +30,20 @@ namespace Libplanet.Net.Protocols
         private readonly ILogger _logger;
 
         public KademliaProtocol(
-            ISwarm swarm,
+            ITransport transport,
             Address address,
-            int appProtocolVersion,
+            AppProtocolVersion appProtocolVersion,
+            IImmutableSet<PublicKey> trustedAppProtocolVersionSigners,
+            DifferentAppProtocolVersionEncountered differentAppProtocolVersionEncountered,
             ILogger logger,
             int? tableSize,
             int? bucketSize,
             TimeSpan? requestTimeout = null)
         {
-            _swarm = swarm;
+            _transport = transport;
             _appProtocolVersion = appProtocolVersion;
+            _trustedAppProtocolVersionSigners = trustedAppProtocolVersionSigners;
+            _differentAppProtocolVersionEncountered = differentAppProtocolVersionEncountered;
             _logger = logger;
 
             _address = address;
@@ -55,7 +64,7 @@ namespace Libplanet.Net.Protocols
         // FIXME: Currently bootstrap is done until it finds closest peer, but it should halt
         // when found neighbor's count is reached 2*k.
         public async Task BootstrapAsync(
-            ImmutableList<BoundPeer> bootstrapPeers,
+            IImmutableList<BoundPeer> bootstrapPeers,
             TimeSpan? pingSeedTimeout,
             TimeSpan? findPeerTimeout,
             int depth,
@@ -154,7 +163,7 @@ namespace Libplanet.Net.Protocols
                             peer,
                             _requestTimeout,
                             cancellationToken)
-                ).ToList();
+                    ).ToList();
 
                 _logger.Debug("Refresh candidates: {Count}", tasks.Count);
 
@@ -163,6 +172,22 @@ namespace Libplanet.Net.Protocols
             }
             catch (TimeoutException)
             {
+            }
+        }
+
+        public async Task CheckAllPeersAsync(CancellationToken cancellationToken, TimeSpan? timeout)
+        {
+            try
+            {
+                _logger.Debug("Start to validate all peers: ({Count})", _routing.Peers.Count());
+                foreach (var peer in _routing.Peers)
+                {
+                    await ValidateAsync(peer, timeout ?? _requestTimeout, cancellationToken);
+                }
+            }
+            catch (TimeoutException e)
+            {
+                _logger.Error(e, "Timeout occurred checking some peers: {e}", e);
             }
         }
 
@@ -243,15 +268,9 @@ namespace Libplanet.Net.Protocols
 #pragma warning disable CS4014 // To run UpdateAsync() without await.
         public void ReceiveMessage(Message message)
         {
-            switch (message)
+            if (message is FindNeighbors findPeer)
             {
-                case Ping ping:
-                    ReceivePing(ping);
-                    break;
-
-                case FindNeighbors findPeer:
-                    ReceiveFindPeer(findPeer);
-                    break;
+                ReceiveFindPeer(findPeer);
             }
 
             UpdateAsync(message?.Remote);
@@ -270,8 +289,12 @@ namespace Libplanet.Net.Protocols
                 }
 
                 trace += $"**Bucket {i}**\n";
-                trace = _routing.BucketOf(i).Peers.Aggregate(trace, (current, peer) =>
-                    current + $"{++count} : [{peer.Address.ToHex()}]\n");
+                trace = _routing.BucketOf(i).PeerStates.Aggregate(trace, (current, state) =>
+                    current +
+                    $"| {++count}: [{state.Address.ToHex()}]\n" +
+                    $"| - LastUpdated: {state.LastUpdated}\n" +
+                    $"| - LastChecked: {state.LastChecked}\n" +
+                    $"| - Latency: {state.Latency?.Milliseconds}ms\n");
 
                 trace = trace.TrimEnd(' ', ',');
             }
@@ -311,6 +334,11 @@ namespace Libplanet.Net.Protocols
                 target,
                 viaPeer,
                 depth);
+
+            if (history is null)
+            {
+                history = new ConcurrentBag<BoundPeer>();
+            }
 
             IEnumerable<BoundPeer> found;
             if (viaPeer is null)
@@ -353,7 +381,8 @@ namespace Libplanet.Net.Protocols
 
             try
             {
-                if (!(await _swarm.SendMessageWithReplyAsync(
+                _logger.Debug("Trying to ping async to {Peer}.", target);
+                if (!(await _transport.SendMessageWithReplyAsync(
                     target,
                     new Ping(),
                     timeout,
@@ -368,9 +397,6 @@ namespace Libplanet.Net.Protocols
                     throw new InvalidMessageException(
                         "Cannot receive pong from self");
                 }
-
-                // update process required
-                UpdateAsync(pong.Remote);
             }
             catch (TimeoutException)
             {
@@ -399,8 +425,10 @@ namespace Libplanet.Net.Protocols
         {
             try
             {
-                _logger.Debug("Validating peer {Peer}", peer);
+                _logger.Debug("Start to validate a peer: {Peer}", peer);
+                DateTimeOffset check = DateTimeOffset.UtcNow;
                 await PingAsync(peer, timeout, cancellationToken);
+                _routing.Check(peer, check, DateTimeOffset.UtcNow);
             }
             catch (TimeoutException)
             {
@@ -422,7 +450,11 @@ namespace Libplanet.Net.Protocols
                 throw new ArgumentNullException(nameof(rawPeer));
             }
 
-            if (!(rawPeer is BoundPeer peer) || rawPeer.AppProtocolVersion != _appProtocolVersion)
+            if (!(rawPeer is BoundPeer peer &&
+                  peer.IsCompatibleWith(
+                      _appProtocolVersion,
+                      _trustedAppProtocolVersionSigners,
+                      _differentAppProtocolVersionEncountered)))
             {
                 // Don't update peer without endpoint or with different appProtocolVersion.
                 return;
@@ -531,7 +563,7 @@ namespace Libplanet.Net.Protocols
             var findPeer = new FindNeighbors(target);
             try
             {
-                if (!(await _swarm.SendMessageWithReplyAsync(
+                if (!(await _transport.SendMessageWithReplyAsync(
                     addressee,
                     findPeer,
                     timeout,
@@ -557,13 +589,6 @@ namespace Libplanet.Net.Protocols
                 throw new ArgumentException(
                     "Cannot receive ping from self");
             }
-
-            Pong pong = new Pong((long?)null)
-            {
-                Identity = ping.Identity,
-            };
-
-            _swarm.ReplyMessage(pong);
         }
 
         /// <summary>
@@ -809,7 +834,7 @@ namespace Libplanet.Net.Protocols
                 Identity = findNeighbors.Identity,
             };
 
-            _swarm.ReplyMessage(neighbors);
+            _transport.ReplyMessage(neighbors);
         }
     }
 }

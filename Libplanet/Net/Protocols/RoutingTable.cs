@@ -7,6 +7,9 @@ namespace Libplanet.Net.Protocols
 {
     internal class RoutingTable
     {
+        // FIXME: This would be configurable.
+        private const int _minPeersToBroadcast = 10;
+
         private readonly Address _address;
         private readonly int _tableSize;
         private readonly int _bucketSize;
@@ -48,7 +51,8 @@ namespace Libplanet.Net.Protocols
         public int Count => _buckets.Sum(bucket => bucket.Count);
 
         public IEnumerable<BoundPeer> Peers => NonEmptyBuckets
-            .SelectMany((bucket, _) => bucket.Peers).ToList();
+            .SelectMany((bucket, _) => bucket.Peers)
+            .ToList();
 
         public IEnumerable<IEnumerable<BoundPeer>> CachesToCheck
         {
@@ -80,16 +84,27 @@ namespace Libplanet.Net.Protocols
 
         public IEnumerable<BoundPeer> PeersToBroadcast(Address? except)
         {
-            return NonEmptyBuckets
+            List<BoundPeer> peers = NonEmptyBuckets
                 .Select(bucket => bucket.GetRandomPeer(except))
-                .Where(peer => !(peer is null));
+                .Where(peer => !(peer is null)).ToList();
+            var count = peers.Count;
+            if (count < _minPeersToBroadcast)
+            {
+                peers.AddRange(Peers
+                    .Where(peer =>
+                        !peers.Contains(peer) &&
+                        (except is null || !peer.Address.Equals(except.Value)))
+                    .Take(_minPeersToBroadcast - count));
+            }
+
+            return peers;
         }
 
         public IEnumerable<BoundPeer> PeersToRefresh(TimeSpan maxAge)
         {
             return NonEmptyBuckets
-                .Where(bucket => bucket.Tail.Value + maxAge < DateTimeOffset.UtcNow)
-                .Select(bucket => bucket.Tail.Key);
+                .Where(bucket => bucket.Tail.LastUpdated + maxAge < DateTimeOffset.UtcNow)
+                .Select(bucket => bucket.Tail.Peer);
         }
 
         public void AddPeer(BoundPeer peer)
@@ -179,6 +194,16 @@ namespace Libplanet.Net.Protocols
             }
 
             return peers;
+        }
+
+        public void Check(BoundPeer peer, DateTimeOffset start, DateTimeOffset end)
+        {
+            if (peer is null)
+            {
+                throw new ArgumentNullException(nameof(peer));
+            }
+
+            BucketOf(peer).Check(peer, start, end);
         }
 
         private int GetBucketIndexOf(Peer peer)

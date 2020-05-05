@@ -1,3 +1,4 @@
+#pragma warning disable S3871
 using System;
 
 namespace Libplanet.Net
@@ -8,7 +9,7 @@ namespace Libplanet.Net
     /// to is different.
     /// </summary>
     [Serializable]
-    public sealed class DifferentAppProtocolVersionException : Exception
+    internal sealed class DifferentAppProtocolVersionException : Exception
     {
         /// <summary>
         /// Initializes a new instance of the
@@ -23,10 +24,13 @@ namespace Libplanet.Net
         /// </param>
         public DifferentAppProtocolVersionException(
             string message,
-            int expectedVersion,
-            int actualVersion)
-            : base($"Expected Version: {expectedVersion}, " +
-                   $"Actual Version: {actualVersion}, {message}")
+            AppProtocolVersion expectedVersion,
+            AppProtocolVersion actualVersion)
+            : base($"{message}\n" +
+                   $"Expected Version: {expectedVersion} " +
+                   $"[{ByteUtil.Hex(expectedVersion.Signature)} by {expectedVersion.Signer}]\n" +
+                   $"Actual Version: {actualVersion} " +
+                   $"[{ByteUtil.Hex(actualVersion.Signature)} by {actualVersion.Signer}]")
         {
             ExpectedVersion = expectedVersion;
             ActualVersion = actualVersion;
@@ -35,12 +39,13 @@ namespace Libplanet.Net
         /// <summary>
         /// The protocol version of the current <see cref="Swarm{T}"/>.
         /// </summary>
-        public int ExpectedVersion { get; }
+        public AppProtocolVersion ExpectedVersion { get; }
 
         /// <summary>
         /// The protocol version of the <see cref="Peer"/> that the
         /// <see cref="Swarm{T}" /> is trying to connect to.
         /// </summary>
-        public int ActualVersion { get; }
+        public AppProtocolVersion ActualVersion { get; }
     }
 }
+#pragma warning restore S3871

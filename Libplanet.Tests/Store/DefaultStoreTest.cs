@@ -17,6 +17,7 @@ namespace Libplanet.Tests.Store
         {
             TestOutputHelper = testOutputHelper;
             Fx = _fx = new DefaultStoreFixture();
+            FxConstructor = () => new DefaultStoreFixture();
         }
 
         public void Dispose()
@@ -62,24 +63,23 @@ namespace Libplanet.Tests.Store
         [Fact]
         public void StateRefDocBlockHash()
         {
-            var address = new PrivateKey().PublicKey.ToAddress();
+            var address = new PrivateKey().ToAddress();
             var random = new Random();
             var bytes = new byte[32];
             random.NextBytes(bytes);
             var hashDigest = new HashDigest<SHA256>(bytes);
             var stateRef = new DefaultStore.StateRefDoc
             {
-                Address = address,
+                StateKey = address.ToHex().ToLowerInvariant(),
                 BlockIndex = 123,
                 BlockHash = hashDigest,
             };
             var stateRef2 = new DefaultStore.StateRefDoc
             {
-                AddressString = stateRef.AddressString,
+                StateKey = stateRef.StateKey,
                 BlockIndex = 123,
                 BlockHashString = stateRef.BlockHashString,
             };
-            Assert.Equal(stateRef.Address, stateRef2.Address);
             Assert.Equal(stateRef.BlockHash, stateRef2.BlockHash);
         }
     }

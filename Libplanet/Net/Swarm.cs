@@ -1,12 +1,11 @@
 using System;
-using System.Collections.Async;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.IO;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
-using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,58 +18,35 @@ using Libplanet.Crypto;
 using Libplanet.Net.Messages;
 using Libplanet.Net.Protocols;
 using Libplanet.Store;
-using Libplanet.Stun;
 using Libplanet.Tx;
-using NetMQ;
-using NetMQ.Sockets;
 using Nito.AsyncEx;
 using Serilog;
 using Serilog.Events;
 
 namespace Libplanet.Net
 {
-    public class Swarm<T> : ISwarm, IDisposable
+    public class Swarm<T> : IDisposable
         where T : IAction, new()
     {
-        private static readonly TimeSpan TurnAllocationLifetime =
-            TimeSpan.FromSeconds(777);
-
-        // TURN Permission lifetime was defined in RFC 5766
-        // see also https://tools.ietf.org/html/rfc5766#section-8
-        private static readonly TimeSpan TurnPermissionLifetime =
-            TimeSpan.FromMinutes(5);
-
+        private const int InitialBlockDownloadWindow = 100;
         private static readonly TimeSpan MaxTimeout = TimeSpan.FromSeconds(150);
         private static readonly TimeSpan BlockRecvTimeout = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan TxRecvTimeout = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan RecentStateRecvTimeout = TimeSpan.FromSeconds(150);
         private readonly PrivateKey _privateKey;
-        private readonly int _appProtocolVersion;
+        private readonly AppProtocolVersion _appProtocolVersion;
 
-        private readonly AsyncLock _runningMutex;
         private readonly AsyncLock _blockSyncMutex;
-        private readonly string _host;
-        private readonly IList<IceServer> _iceServers;
+        private readonly AsyncLock _runningMutex;
 
         private readonly ILogger _logger;
+        private readonly IStore _store;
 
-        private RouterSocket _router;
-        private NetMQQueue<Message> _replyQueue;
-        private NetMQQueue<(Address?, Message)> _broadcastQueue;
-        private AsyncCollection<MessageRequest> _requests;
-        private NetMQPoller _poller;
-
-        private TaskCompletionSource<object> _runningEvent;
-        private int? _listenPort;
-        private TurnClient _turnClient;
-        private bool _behindNAT;
         private CancellationTokenSource _workerCancellationTokenSource;
-        private CancellationTokenSource _runtimeCancellationTokenSource;
         private CancellationToken _cancellationToken;
-        private IPAddress _publicIPAddress;
-        private Task _runtimeProcessor;
 
-        private IStore _store;
+        private (long, BoundPeer, HashDigest<SHA256>)? _demandBlockHash;
+        private ConcurrentDictionary<TxId, BoundPeer> _demandTxIds;
 
         static Swarm()
         {
@@ -80,17 +56,41 @@ namespace Libplanet.Net
             }
         }
 
+        /// <summary>
+        /// Creates a <see cref="Swarm{T}"/>.  This constructor in only itself does not start
+        /// any communication with the network.
+        /// </summary>
+        /// <param name="blockChain">A blockchain to publicize on the network.</param>
+        /// <param name="privateKey">A private key to sign messages.  The public part of
+        /// this key become a part of its end address for being pointed by peers.</param>
+        /// <param name="appProtocolVersion">An app protocol to comply.</param>
+        /// <param name="workers">The number of background workers (i.e., threads).</param>
+        /// <param name="host">A hostname to be a part of a public endpoint, that peers use when
+        /// they connect to this node.  Note that this is not a hostname to listen to;
+        /// <see cref="Swarm{T}"/> always listens to 0.0.0.0 &amp; ::/0.</param>
+        /// <param name="listenPort">A port number to listen to.</param>
+        /// <param name="iceServers">
+        /// <a href="https://en.wikipedia.org/wiki/Interactive_Connectivity_Establishment">ICE</a>
+        /// servers to use for TURN/STUN.  Purposes to traverse NAT.</param>
+        /// <param name="differentAppProtocolVersionEncountered">A delegate called back when a peer
+        /// with one different from <paramref name="appProtocolVersion"/>, and their version is
+        /// signed by a trusted party (i.e., <paramref name="trustedAppProtocolVersionSigners"/>).
+        /// If this callback returns <c>false</c> an encountered peer is ignored.  If this callback
+        /// is omitted all peers with different <see cref="AppProtocolVersion"/>s are ignored.
+        /// </param>
+        /// <param name="trustedAppProtocolVersionSigners"><see cref="PublicKey"/>s of parties
+        /// to trust <see cref="AppProtocolVersion"/>s they signed.  To trust any party, pass
+        /// <c>null</c>, which is default.</param>
         public Swarm(
             BlockChain<T> blockChain,
             PrivateKey privateKey,
-            int appProtocolVersion,
+            AppProtocolVersion appProtocolVersion,
             int workers = 5,
             string host = null,
             int? listenPort = null,
-            DateTimeOffset? createdAt = null,
             IEnumerable<IceServer> iceServers = null,
-            EventHandler<DifferentProtocolVersionEventArgs>
-                differentVersionPeerEncountered = null)
+            DifferentAppProtocolVersionEncountered differentAppProtocolVersionEncountered = null,
+            IEnumerable<PublicKey> trustedAppProtocolVersionSigners = null)
             : this(
                 blockChain,
                 privateKey,
@@ -100,16 +100,17 @@ namespace Libplanet.Net
                 workers,
                 host,
                 listenPort,
-                createdAt,
+                null,
                 iceServers,
-                differentVersionPeerEncountered)
+                differentAppProtocolVersionEncountered,
+                trustedAppProtocolVersionSigners)
         {
         }
 
         internal Swarm(
             BlockChain<T> blockChain,
             PrivateKey privateKey,
-            int appProtocolVersion,
+            AppProtocolVersion appProtocolVersion,
             int? tableSize,
             int? bucketSize,
             int workers = 5,
@@ -117,10 +118,9 @@ namespace Libplanet.Net
             int? listenPort = null,
             DateTimeOffset? createdAt = null,
             IEnumerable<IceServer> iceServers = null,
-            EventHandler<DifferentProtocolVersionEventArgs> differentVersionPeerEncountered = null)
+            DifferentAppProtocolVersionEncountered differentAppProtocolVersionEncountered = null,
+            IEnumerable<PublicKey> trustedAppProtocolVersionSigners = null)
         {
-            Running = false;
-
             BlockChain = blockChain ?? throw new ArgumentNullException(nameof(blockChain));
             _store = BlockChain.Store;
             _privateKey = privateKey ?? throw new ArgumentNullException(nameof(privateKey));
@@ -131,85 +131,34 @@ namespace Libplanet.Net
                 DateTimeOffset.UtcNow);
             LastReceived = now;
             TxReceived = new AsyncAutoResetEvent();
+            BlockHeaderReceived = new AsyncAutoResetEvent();
             BlockAppended = new AsyncAutoResetEvent();
             BlockReceived = new AsyncAutoResetEvent();
-            DifferentVersionPeerEncountered = differentVersionPeerEncountered;
 
             _blockSyncMutex = new AsyncLock();
             _runningMutex = new AsyncLock();
 
-            _host = host;
-            _listenPort = listenPort;
             _appProtocolVersion = appProtocolVersion;
+            TrustedAppProtocolVersionSigners =
+                trustedAppProtocolVersionSigners?.ToImmutableHashSet();
 
-            if (_host != null && _listenPort is int listenPortAsInt)
-            {
-                EndPoint = new DnsEndPoint(_host, listenPortAsInt);
-            }
-
-            _iceServers = iceServers?.ToList();
-            if (_host == null && (_iceServers == null || !_iceServers.Any()))
-            {
-                throw new ArgumentException(
-                    $"Swarm requires either {nameof(host)} or " +
-                    $"{nameof(iceServers)}."
-                );
-            }
-
-            string loggerId = _privateKey.PublicKey.ToAddress().ToHex();
+            string loggerId = _privateKey.ToAddress().ToHex();
             _logger = Log.ForContext<Swarm<T>>()
                 .ForContext("SwarmId", loggerId);
 
-            Protocol = new KademliaProtocol(
-                this,
-                _privateKey.PublicKey.ToAddress(),
+            Transport = new NetMQTransport(
+                _privateKey,
                 _appProtocolVersion,
-                _logger,
+                TrustedAppProtocolVersionSigners,
                 tableSize,
-                bucketSize);
-
-            _requests = new AsyncCollection<MessageRequest>();
-            _runtimeCancellationTokenSource = new CancellationTokenSource();
-            _runtimeProcessor = Task.Factory.StartNew(
-                () =>
-                {
-                    // Ignore NetMQ related exceptions during NetMQRuntime.Dispose() to stabilize
-                    // tests
-                    try
-                    {
-                        using (var runtime = new NetMQRuntime())
-                        {
-                            var workerTasks = new Task[workers];
-
-                            for (int i = 0; i < workers; i++)
-                            {
-                                workerTasks[i] = ProcessRuntime(
-                                    _runtimeCancellationTokenSource.Token
-                                );
-                            }
-
-                            runtime.Run(workerTasks);
-                        }
-                    }
-                    catch (NetMQException e)
-                    {
-                        _logger.Error(
-                            e,
-                            $"NetMQException occurred in {nameof(_runtimeProcessor)}."
-                        );
-                    }
-                    catch (ObjectDisposedException e)
-                    {
-                        _logger.Error(
-                            e,
-                            $"ObjectDisposedException occurred in {nameof(_runtimeProcessor)}."
-                        );
-                    }
-                },
-                CancellationToken.None,
-                TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
-                TaskScheduler.Default
-            );
+                bucketSize,
+                workers,
+                host,
+                listenPort,
+                iceServers,
+                differentAppProtocolVersionEncountered,
+                ProcessMessageHandler,
+                _logger);
         }
 
         ~Swarm()
@@ -218,31 +167,18 @@ namespace Libplanet.Net
             if (Running)
             {
                 _logger.Warning(
-                    "Swarm is scheduled to destruct, but it's still running.");
+                    "Swarm is scheduled to destruct, but NetMQTransport progress is still running."
+                );
             }
         }
 
-        /// <summary>
-        /// The <see cref="EventHandler" /> triggered when the different version of
-        /// <see cref="Peer" /> is discovered.
-        /// </summary>
-        public event EventHandler<DifferentProtocolVersionEventArgs>
-            DifferentVersionPeerEncountered;
+        public bool Running => Transport is NetMQTransport p && p.Running;
 
-        public DnsEndPoint EndPoint { get; private set; }
+        public DnsEndPoint EndPoint => AsPeer is BoundPeer boundPeer ? boundPeer.EndPoint : null;
 
-        public Address Address => _privateKey.PublicKey.ToAddress();
+        public Address Address => _privateKey.ToAddress();
 
-        public Peer AsPeer => EndPoint is null
-            ? new Peer(
-                _privateKey.PublicKey,
-                _appProtocolVersion,
-                _publicIPAddress)
-            : new BoundPeer(
-                _privateKey.PublicKey,
-                EndPoint,
-                _appProtocolVersion,
-                _publicIPAddress);
+        public Peer AsPeer => Transport.AsPeer;
 
         public DateTimeOffset LastReceived { get; private set; }
 
@@ -252,35 +188,23 @@ namespace Libplanet.Net
             private set;
         }
 
+        public IEnumerable<BoundPeer> Peers => Transport.Peers;
+
         /// <summary>
         /// The <see cref="BlockChain{T}"/> instance this <see cref="Swarm{T}"/> instance
         /// synchronizes with.
         /// </summary>
         public BlockChain<T> BlockChain { get; private set; }
 
-        /// <summary>
-        /// Whether this <see cref="Swarm{T}"/> instance is running.
-        /// </summary>
-        public bool Running
-        {
-            get => _runningEvent.Task.Status == TaskStatus.RanToCompletion;
+        public IImmutableSet<PublicKey> TrustedAppProtocolVersionSigners { get; }
 
-            private set
-            {
-                if (value)
-                {
-                    _runningEvent.TrySetResult(null);
-                }
-                else
-                {
-                    _runningEvent = new TaskCompletionSource<object>();
-                }
-            }
-        }
+        internal ITransport Transport { get; private set; }
 
-        public IEnumerable<BoundPeer> Peers => Protocol.Peers;
+        internal IProtocol Protocol => (Transport as NetMQTransport)?.Protocol;
 
         internal AsyncAutoResetEvent TxReceived { get; }
+
+        internal AsyncAutoResetEvent BlockHeaderReceived { get; }
 
         internal AsyncAutoResetEvent BlockReceived { get; }
 
@@ -289,12 +213,10 @@ namespace Libplanet.Net
 
         internal TimeSpan BlockHashRecvTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
-        internal IProtocol Protocol { get; private set; }
-
         // FIXME: We need some sort of configuration method for it.
         internal int FindNextHashesChunkSize { get; set; } = 500;
 
-        internal int FindNextStatesChunkSize { get; set; } = 1000;
+        internal int FindNextStatesChunkSize { get; set; } = 2500;
 
         internal AsyncAutoResetEvent PreloadStarted { get; } = new AsyncAutoResetEvent();
 
@@ -305,15 +227,13 @@ namespace Libplanet.Net
         /// <summary>
         /// Waits until this <see cref="Swarm{T}"/> instance gets started to run.
         /// </summary>
-        /// <returns>A <see cref="Task"/> completed when <see cref="Running"/>
+        /// <returns>A <see cref="Task"/> completed when <see cref="NetMQTransport.Running"/>
         /// property becomes <c>true</c>.</returns>
-        public Task WaitForRunningAsync() => _runningEvent.Task;
+        public Task WaitForRunningAsync() => (Transport as NetMQTransport)?.WaitForRunningAsync();
 
         public void Dispose()
         {
-            _runtimeCancellationTokenSource.Cancel();
-
-            _runtimeProcessor.Wait();
+            Transport.Dispose();
         }
 
         public async Task StopAsync(
@@ -329,44 +249,23 @@ namespace Libplanet.Net
         )
         {
             _workerCancellationTokenSource?.Cancel();
-            _logger.Debug("Stopping...");
+            _logger.Debug($"Stopping {nameof(Swarm<T>)}...");
             using (await _runningMutex.LockAsync())
             {
-                if (Running)
-                {
-                    await Task.Delay(waitFor, cancellationToken);
-
-                    _broadcastQueue.ReceiveReady -= DoBroadcast;
-                    _replyQueue.ReceiveReady -= DoReply;
-                    _router.ReceiveReady -= ReceiveMessage;
-
-                    if (_poller.IsRunning)
-                    {
-                        _poller.Dispose();
-                    }
-
-                    _broadcastQueue.Dispose();
-                    _replyQueue.Dispose();
-                    _router.Dispose();
-                    _turnClient?.Dispose();
-
-                    Running = false;
-                }
+                await Transport.StopAsync(waitFor, cancellationToken);
             }
 
-            _logger.Debug("Stopped.");
+            _logger.Debug($"{nameof(Swarm<T>)} stopped.");
         }
 
         public async Task StartAsync(
             int millisecondsDialTimeout = 15000,
             int millisecondsBroadcastTxInterval = 5000,
-            EventHandler<PreloadBlockDownloadFailEventArgs> preloadBlockDownloadFailed = null,
             CancellationToken cancellationToken = default(CancellationToken))
         {
             await StartAsync(
                 TimeSpan.FromMilliseconds(millisecondsDialTimeout),
                 TimeSpan.FromMilliseconds(millisecondsBroadcastTxInterval),
-                preloadBlockDownloadFailed: preloadBlockDownloadFailed,
                 cancellationToken
             );
         }
@@ -379,13 +278,7 @@ namespace Libplanet.Net
         /// </param>
         /// <param name="broadcastTxInterval">The time period of exchange of staged transactions.
         /// </param>
-        /// <param name="preloadBlockDownloadFailed">
-        /// The <see cref="EventHandler" /> triggered when
-        /// <see cref="PreloadAsync(TimeSpan?, IProgress{PreloadState}, IImmutableSet{Address},
-        /// EventHandler{PreloadBlockDownloadFailEventArgs}, CancellationToken)" />
-        /// fails to download blocks.
-        /// </param>
-        /// /// <param name="cancellationToken">
+        /// <param name="cancellationToken">
         /// A cancellation token used to propagate notification that this
         /// operation should be canceled.
         /// </param>
@@ -404,122 +297,26 @@ namespace Libplanet.Net
         public async Task StartAsync(
             TimeSpan dialTimeout,
             TimeSpan broadcastTxInterval,
-            EventHandler<PreloadBlockDownloadFailEventArgs> preloadBlockDownloadFailed = null,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            if (Running)
-            {
-                throw new SwarmException("Swarm is already running.");
-            }
-
-            _router = new RouterSocket();
-            _router.Options.RouterHandover = true;
-
-            if (_host is null && !(_iceServers is null))
-            {
-                _turnClient = await IceServer.CreateTurnClient(_iceServers);
-            }
-
-            if (_listenPort == null)
-            {
-                _listenPort = _router.BindRandomPort("tcp://*");
-            }
-            else
-            {
-                _router.Bind($"tcp://*:{_listenPort}");
-            }
-
-            _logger.Information($"Listen on {_listenPort}");
-
+            var tasks = new List<Task>();
             _workerCancellationTokenSource = new CancellationTokenSource();
-            CancellationToken workerCancellationToken =
-                CancellationTokenSource.CreateLinkedTokenSource(
+            _cancellationToken = CancellationTokenSource.CreateLinkedTokenSource(
                     _workerCancellationTokenSource.Token, cancellationToken
                 ).Token;
-            _cancellationToken = workerCancellationToken;
-            var tasks = new List<Task>();
-
-            if (!(_turnClient is null))
-            {
-                _publicIPAddress = (await _turnClient.GetMappedAddressAsync()).Address;
-
-                if (await _turnClient.IsBehindNAT())
-                {
-                    _behindNAT = true;
-                }
-            }
-
-            if (_behindNAT)
-            {
-                IPEndPoint turnEp = await _turnClient.AllocateRequestAsync(
-                    TurnAllocationLifetime
-                );
-                EndPoint = new DnsEndPoint(turnEp.Address.ToString(), turnEp.Port);
-
-                // FIXME should be parameterized
-                tasks.Add(BindingProxies(_cancellationToken));
-                tasks.Add(BindingProxies(_cancellationToken));
-                tasks.Add(BindingProxies(_cancellationToken));
-                tasks.Add(RefreshAllocate(_cancellationToken));
-                tasks.Add(RefreshPermissions(_cancellationToken));
-            }
-            else if (_host is null)
-            {
-                EndPoint = new DnsEndPoint(_publicIPAddress.ToString(), _listenPort.Value);
-            }
-            else
-            {
-                EndPoint = new DnsEndPoint(_host, _listenPort.Value);
-            }
-
-            _replyQueue = new NetMQQueue<Message>();
-            _broadcastQueue = new NetMQQueue<(Address?, Message)>();
-            _poller = new NetMQPoller { _router, _replyQueue, _broadcastQueue };
-
-            _router.ReceiveReady += ReceiveMessage;
-            _replyQueue.ReceiveReady += DoReply;
-            _broadcastQueue.ReceiveReady += DoBroadcast;
+            _demandBlockHash = null;
+            _demandTxIds = new ConcurrentDictionary<TxId, BoundPeer>();
+            await Transport.StartAsync(_cancellationToken);
 
             _logger.Debug("Starting swarm...");
             _logger.Debug("Peer information : {Peer}", AsPeer);
 
-            using (await _runningMutex.LockAsync())
-            {
-                await PreloadAsync(
-                    dialTimeout: dialTimeout,
-                    render: true,
-                    cancellationToken: _cancellationToken
-                );
-                Running = true;
-            }
-
             try
             {
+                tasks.Add(Transport.RunAsync(_cancellationToken));
                 tasks.Add(BroadcastTxAsync(broadcastTxInterval, _cancellationToken));
-                tasks.Add(
-                    RefreshTableAsync(
-                        TimeSpan.FromSeconds(10),
-                        TimeSpan.FromSeconds(10),
-                        _cancellationToken));
-                tasks.Add(RebuildConnectionAsync(TimeSpan.FromMinutes(30), _cancellationToken));
-                tasks.Add(
-                    Task.Run(() =>
-                    {
-                        // Ignore NetMQ related exceptions during NetMQPoller.Run() to stabilize
-                        // tests.
-                        try
-                        {
-                            _poller.Run();
-                        }
-                        catch (TerminatingException)
-                        {
-                            _logger.Error($"TerminatingException occurred in {nameof(_poller)}");
-                        }
-                        catch (ObjectDisposedException)
-                        {
-                            _logger.Error($"ObjectDisposedException occurred in {nameof(_poller)}");
-                        }
-                    }));
+                tasks.Add(ProcessFillblock(_cancellationToken));
+                tasks.Add(ProcessFillTxs(_cancellationToken));
                 _logger.Debug("Swarm started.");
 
                 await await Task.WhenAny(tasks);
@@ -581,17 +378,17 @@ namespace Libplanet.Net
 
             IEnumerable<BoundPeer> peers = seedPeers.OfType<BoundPeer>();
 
-            await Protocol.BootstrapAsync(
-                peers.ToImmutableList(),
+            await Transport.BootstrapAsync(
+                peers,
                 pingSeedTimeout,
                 findNeighborsTimeout,
                 depth,
                 cancellationToken);
         }
 
-        public void BroadcastBlocks(IEnumerable<Block<T>> blocks)
+        public void BroadcastBlock(Block<T> block)
         {
-            BroadcastBlocks(null, blocks);
+            BroadcastBlock(null, block);
         }
 
         public void BroadcastTxs(IEnumerable<Transaction<T>> txs)
@@ -601,29 +398,9 @@ namespace Libplanet.Net
 
         public string TraceTable()
         {
-            return Protocol is null ? string.Empty : Protocol.Trace();
+            return Transport is null ? string.Empty : (Transport as NetMQTransport)?.Trace();
         }
 
-        async Task<Message> ISwarm.SendMessageWithReplyAsync(
-            BoundPeer peer,
-            Message message,
-            TimeSpan? timeout,
-            CancellationToken cancellationToken)
-        {
-            IEnumerable<Message> replies =
-                await SendMessageWithReplyAsync(peer, message, timeout, 1, cancellationToken);
-            Message reply = replies.First();
-            ValidateSender(reply.Remote);
-
-            return reply;
-        }
-
-        void ISwarm.ReplyMessage(Message message)
-        {
-            _replyQueue.Enqueue(message);
-        }
-
-#pragma warning disable MEN002 // Line is too long
         /// <summary>
         /// Preemptively downloads blocks from registered <see cref="Peer"/>s.
         /// </summary>
@@ -654,14 +431,14 @@ namespace Libplanet.Net
         /// You only can <c>await</c> until the method is completed.
         /// </returns>
         /// <remarks>This does not render downloaded <see cref="IAction"/>s, but fills states only.
-        /// If you want to render all <see cref="IAction"/>s from the genesis block to the recent
-        /// blocks use
-        /// <see cref="StartAsync(TimeSpan, TimeSpan, EventHandler{PreloadBlockDownloadFailEventArgs}, CancellationToken)"/>
-        /// method instead.</remarks>
+        /// </remarks>
         /// <exception cref="AggregateException">Thrown when the given the block downloading is
         /// failed and if <paramref name="blockDownloadFailed "/> is <c>null</c>.</exception>
-#pragma warning restore MEN002 // Line is too long
-        public Task PreloadAsync(
+        [SuppressMessage(
+            "Microsoft.StyleCop.CSharp.ReadabilityRules",
+            "MEN003",
+            Justification = "Many lines are just for writing logs.")]
+        public async Task PreloadAsync(
             TimeSpan? dialTimeout = null,
             IProgress<PreloadState> progress = null,
             IImmutableSet<Address> trustedStateValidators = null,
@@ -669,56 +446,24 @@ namespace Libplanet.Net
             CancellationToken cancellationToken = default(CancellationToken)
         )
         {
-            return PreloadAsync(
-                render: false,
-                dialTimeout: dialTimeout,
-                progress: progress,
-                trustedStateValidators: trustedStateValidators,
-                blockDownloadFailed: blockDownloadFailed,
-                cancellationToken: cancellationToken
+            cancellationToken.Register(() =>
+                _logger.Information("Preloading is requested to be cancelled.")
             );
-        }
 
-        public async Task<BoundPeer> FindSpecificPeerAsync(
-            Address target,
-            Address searchAddress,
-            int depth,
-            BoundPeer viaPeer,
-            TimeSpan? timeout,
-            CancellationToken cancellationToken)
-        {
-            KademliaProtocol kp = (KademliaProtocol)Protocol;
-            return await kp.FindSpecificPeerAsync(
-                new ConcurrentBag<BoundPeer>(),
-                target,
-                viaPeer,
-                depth,
-                searchAddress,
-                timeout,
-                cancellationToken);
-        }
-
-        // FIXME: It is not guaranteed that states will be reported in order. see issue #436, #430
-        internal async Task PreloadAsync(
-            bool render,
-            TimeSpan? dialTimeout = null,
-            IProgress<PreloadState> progress = null,
-            IImmutableSet<Address> trustedStateValidators = null,
-            EventHandler<PreloadBlockDownloadFailEventArgs> blockDownloadFailed = null,
-            CancellationToken cancellationToken = default(CancellationToken)
-        )
-        {
-            trustedStateValidators = trustedStateValidators ?? ImmutableHashSet<Address>.Empty;
+            trustedStateValidators ??= ImmutableHashSet<Address>.Empty;
 
             Block<T> initialTip = BlockChain.Tip;
             BlockLocator initialLocator = BlockChain.GetBlockLocator();
-            _logger.Debug($"initialTip? : {BlockChain.Tip}");
+            _logger.Debug(
+                "The tip before preloading begins: #{TipIndex} {TipHash}",
+                BlockChain.Tip.Index,
+                BlockChain.Tip.Hash
+            );
 
-            IList<(BoundPeer, long?)> peersWithHeight =
-                await DialToExistingPeers(dialTimeout, cancellationToken)
+            var peersWithHeight = (await DialToExistingPeers(dialTimeout, cancellationToken))
                 .Where(pp => pp.Item2.TipIndex > (initialTip?.Index ?? -1))
                 .Select(pp => (pp.Item1, pp.Item2.TipIndex))
-                .ToListAsync(cancellationToken);
+                .ToList();
 
             if (!peersWithHeight.Any())
             {
@@ -738,90 +483,278 @@ namespace Libplanet.Net
             BlockChain<T> workspace = initialTip is Block<T> tip
                 ? BlockChain.Fork(tip.Hash)
                 : new BlockChain<T>(BlockChain.Policy, _store, Guid.NewGuid(), BlockChain.Genesis);
+            Guid wId = workspace.Id;
+            IStore wStore = workspace.Store;
 
             var complete = false;
 
             try
             {
-                var exceptions = new List<Exception>();
-                var blockDownloadComplete = false;
-                foreach ((BoundPeer Peer, long? Height) peerWithHeight in peersWithHeight)
+                FillBlocksAsyncStarted.Set();
+
+                var blockCompletion = new BlockCompletion<BoundPeer, T>(
+                    completionPredicate: workspace.ContainsBlock,
+                    window: InitialBlockDownloadWindow
+                );
+
+                long totalBlocksToDownload = 0L;
+                long receivedBlockCount = 0L;
+                short lapCount = 0;
+                Block<T> tipCandidate = initialTip;
+
+                Block<T> tempTip = tipCandidate;
+
+                try
                 {
-                    try
+                    // From the second lap, as it's catching up the latest blocks made
+                    // in very short time, do not report the progress.  Even if it's reported,
+                    // it can be very confusing, because it looks like BlockHashDownloadState
+                    // recurring after later phases like BlockDownloadState.
+                    IProgress<PreloadState> demandProgress = lapCount++ < 1 ? progress : null;
+
+                    var demandBlockHashes = GetDemandBlockHashes(
+                        workspace,
+                        peersWithHeight,
+                        demandProgress,
+                        cancellationToken
+                    ).WithCancellation(cancellationToken);
+
+                    await foreach (var pair in demandBlockHashes)
                     {
-                        _logger.Information(
-                            "Try to download blocks from {EndPoint}@{Address}.",
-                            peerWithHeight.Peer.EndPoint,
-                            peerWithHeight.Peer.Address.ToHex());
-                        await SyncBehindsBlocksFromPeerAsync(
-                            workspace,
-                            peerWithHeight,
-                            progress,
-                            cancellationToken,
-                            render
+                        (long index, HashDigest<SHA256> hash) = pair;
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        if (index == 0 && !hash.Equals(workspace.Genesis.Hash))
+                        {
+                            // FIXME: This behavior can unexpectedly terminate the swarm
+                            // (and the game app) if it encounters a peer having a different
+                            // blockchain, and therefore can be exploited to remotely shut
+                            // down other nodes as well.
+                            // Since the intention of this behavior is to prevent mistakes
+                            // to try to connect incorrect seeds (by a user),
+                            // this behavior should be limited for only seed peers.
+                            var msg =
+                                $"Since the genesis block is fixed to {workspace.Genesis} " +
+                                "protocol-wise, the blockchain which does not share " +
+                                "any mutual block is not acceptable.";
+                            var e = new InvalidGenesisBlockException(
+                                hash,
+                                workspace.Genesis.Hash,
+                                msg);
+                            throw new AggregateException(msg, e);
+                        }
+
+                        _logger.Verbose(
+                            "Enqueue #{BlockIndex} {BlockHash} to demands queue...",
+                            index,
+                            hash
                         );
+                        if (blockCompletion.Demand(hash))
+                        {
+                            totalBlocksToDownload++;
+                        }
                     }
-                    catch (Exception e)
-                    {
-                        _logger.Error(
-                            "Exception was thrown during downloading blocks from "
-                            + "{EndPoint}@{Address}.\n{Exception}",
-                            peerWithHeight.Peer.EndPoint,
-                            peerWithHeight.Peer.Address.ToHex(),
-                            e);
-                        exceptions.Add(e);
-                        continue;
-                    }
-
-                    _logger.Information(
-                        "Finished to download blocks from {EndPoint}@{Address}.",
-                        peerWithHeight.Peer.EndPoint,
-                        peerWithHeight.Peer.Address.ToHex());
-                    blockDownloadComplete = true;
-                    break;
                 }
-
-                if (!blockDownloadComplete)
+                catch (AggregateException e)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     if (blockDownloadFailed is null)
                     {
-                        throw new AggregateException(
-                            "Failed to download blocks from peers.",
-                            exceptions);
+                        throw new AggregateException(e.Message, e.InnerExceptions);
                     }
-                    else
-                    {
-                        blockDownloadFailed.Invoke(
-                            this,
-                            new PreloadBlockDownloadFailEventArgs { InnerExceptions = exceptions });
-                    }
+
+                    blockDownloadFailed.Invoke(
+                        this,
+                        new PreloadBlockDownloadFailEventArgs
+                        {
+                            InnerExceptions = e.InnerExceptions,
+                        }
+                    );
+
+                    return;
                 }
 
-                if (workspace.Tip is null)
+                IAsyncEnumerable<Tuple<Block<T>, BoundPeer>> completedBlocks =
+                    blockCompletion.Complete(
+                        peers: peersWithHeight.Select(pair => pair.Item1).ToList(),
+                        blockFetcher: GetBlocksAsync,
+                        cancellationToken: cancellationToken
+                    );
+                await foreach (var pair in completedBlocks)
+                {
+                    pair.Deconstruct(out Block<T> block, out BoundPeer sourcePeer);
+                    _logger.Verbose(
+                        "Got #{BlockIndex} {BlockHash} from {Pair}.",
+                        block.Index,
+                        block.Hash,
+                        sourcePeer
+                    );
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (block.Index == 0 && !block.Hash.Equals(workspace.Genesis.Hash))
+                    {
+                        // FIXME: This behavior can unexpectedly terminate the swarm
+                        // (and the game app) if it encounters a peer having a different
+                        // blockchain, and therefore can be exploited to remotely shut
+                        // down other nodes as well.
+                        // Since the intention of this behavior is to prevent mistakes
+                        // to try to connect incorrect seeds (by a user),
+                        // this behavior should be limited for only seed peers.
+                        var msg =
+                            $"Since the genesis block is fixed to {workspace.Genesis} " +
+                            "protocol-wise, the blockchain which does not share " +
+                            "any mutual block is not acceptable.";
+
+                        // Although it's actually not aggregated, but to be consistent with
+                        // above code throwing InvalidGenesisBlockException, makes this
+                        // to wrap an exception with AggregateException... Not sure if
+                        // it show be wrapped from the very beginning.
+                        throw new AggregateException(
+                            msg,
+                            new InvalidGenesisBlockException(
+                                block.Hash,
+                                workspace.Genesis.Hash,
+                                msg
+                            )
+                        );
+                    }
+
+                    _logger.Verbose(
+                        "Add a block #{BlockIndex} {BlockHash}...",
+                        block.Index,
+                        block.Hash
+                    );
+                    wStore.PutBlock(block);
+                    if (tempTip is null || block.Index > tempTip.Index)
+                    {
+                        tempTip = block;
+                    }
+
+                    receivedBlockCount++;
+                    progress?.Report(new BlockDownloadState
+                    {
+                        TotalBlockCount = Math.Max(
+                            totalBlocksToDownload,
+                            receivedBlockCount),
+                        ReceivedBlockCount = receivedBlockCount,
+                        ReceivedBlockHash = block.Hash,
+                        SourcePeer = sourcePeer,
+                    });
+                    _logger.Debug(
+                        "Appended a block #{BlockIndex} {BlockHash} " +
+                        "to the workspace chain.",
+                        block.Index,
+                        block.Hash
+                    );
+                }
+
+                tipCandidate = tempTip;
+
+                if (tipCandidate is null)
                 {
                     // If there is no blocks in the network (or no consensus at least)
                     // it doesn't need to receive states from other peers at all.
                     return;
                 }
-                else if (render)
+
+                var deltaBlocks = new LinkedList<Block<T>>();
+                while (true)
                 {
-                    // If it's already rendered by SyncBehindsBlocksFromPeersAsync() method
-                    // it means states are already calculated so that it does not need to receive
-                    // calculated states from trusted peers.
-                    complete = true;
-                    return;
+                    Block<T> blockToAdd;
+                    if (deltaBlocks.First is LinkedListNode<Block<T>> node)
+                    {
+                        Block<T> b = node.Value;
+                        if (b.PreviousHash is HashDigest<SHA256> p)
+                        {
+                            blockToAdd = wStore.GetBlock<T>(p);
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        blockToAdd = tipCandidate;
+                    }
+
+                    if (!(initialTip is null) &&
+                        blockToAdd.Index <= initialTip.Index &&
+                        wStore.IndexBlockHash(wId, blockToAdd.Index).Equals(blockToAdd.Hash))
+                    {
+                        break;
+                    }
+
+                    deltaBlocks.AddFirst(blockToAdd);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (deltaBlocks.First is LinkedListNode<Block<T>> deltaBottom)
+                {
+                    Block<T> bottomBlock = deltaBottom.Value;
+                    if (bottomBlock.PreviousHash is HashDigest<SHA256> bp)
+                    {
+                        BlockChain<T> fork = workspace.Fork(bp);
+                        try
+                        {
+                            long verifiedBlockCount = 0;
+                            foreach (Block<T> deltaBlock in deltaBlocks)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                fork.Append(
+                                    deltaBlock,
+                                    DateTimeOffset.UtcNow,
+                                    evaluateActions: false,
+                                    renderActions: false
+                                );
+                                progress?.Report(new BlockVerificationState
+                                {
+                                    TotalBlockCount = deltaBlocks.Count,
+                                    VerifiedBlockCount = ++verifiedBlockCount,
+                                    VerifiedBlockHash = deltaBlock.Hash,
+                                });
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            _logger.Error(
+                                e,
+                                "An exception occurred during appending blocks: {Exception}",
+                                e
+                            );
+                            throw;
+                        }
+
+                        cancellationToken.ThrowIfCancellationRequested();
+                        workspace.Swap(fork, render: false);
+                        wId = fork.Id;
+                    }
+                    else
+                    {
+                        Block<T> first = deltaBlocks.First.Value, last = deltaBlocks.Last.Value;
+                        HashDigest<SHA256> g = wStore.IndexBlockHash(wId, 0L).Value;
+                        throw new SwarmException(
+                            $"Downloaded blocks (#{first.Index} {first.Hash}\u2013" +
+                            $"#{last.Index} {last.Hash}) are incompatible with the existing " +
+                            $"chain (#0 {g}\u2013#{initialTip.Index} {initialTip.Hash})."
+                        );
+                    }
                 }
 
                 long height = workspace.Tip.Index;
 
                 IEnumerable<(BoundPeer, HashDigest<SHA256> Hash)> trustedPeersWithTip =
                     peersWithHeight.Where(pair =>
-                        trustedStateValidators.Contains(pair.Item1.Address) &&
-                        !(pair.Item2 is null) &&
-                        pair.Item2 <= height)
+                            trustedStateValidators.Contains(pair.Item1.Address) &&
+                            !(pair.Item2 is null) &&
+                            pair.Item2 <= height)
                         .OrderByDescending(pair => pair.Item2)
                         .Select(pair => (pair.Item1, workspace[pair.Item2.Value].Hash));
 
+                // FIXME: It is not guaranteed that states will be reported in order.
+                // see issue #436, #430
                 long? receivedStateHeight = await SyncRecentStatesFromTrustedPeersAsync(
                     workspace,
                     progress,
@@ -856,12 +789,11 @@ namespace Libplanet.Net
                     _logger.Debug(
                         "Preloading is aborted; delete the temporary working chain ({0}: {1}), " +
                         "and make the existing chain ({2}: {3}) remains.",
-                        workspace.Id,
+                        wId,
                         workspace.Tip,
                         BlockChain.Id,
                         BlockChain.Tip
                     );
-                    _store.DeleteChainId(workspace.Id);
                 }
                 else
                 {
@@ -870,14 +802,60 @@ namespace Libplanet.Net
                         "the working chain ({2}: {3}).",
                         BlockChain.Id,
                         BlockChain.Tip,
-                        workspace.Id,
+                        wId,
                         workspace.Tip
                     );
                     BlockChain.Swap(workspace, render: false);
                 }
 
-                cancellationToken.ThrowIfCancellationRequested();
+                foreach (Guid chainId in wStore.ListChainIds().ToList())
+                {
+                    if (!chainId.Equals(BlockChain.Id))
+                    {
+                        _logger.Verbose("Delete an unused chain: {ChainId}", chainId);
+                        wStore.DeleteChainId(chainId);
+                    }
+                }
+
+                _logger.Verbose("Remaining chains: {@ChainIds}", wStore.ListChainIds());
             }
+        }
+
+        public async Task<BoundPeer> FindSpecificPeerAsync(
+            Address target,
+            Address searchAddress,
+            int depth,
+            BoundPeer viaPeer,
+            TimeSpan? timeout,
+            CancellationToken cancellationToken)
+        {
+            NetMQTransport netMQTransport = (NetMQTransport)Transport;
+            return await netMQTransport.FindSpecificPeerAsync(
+                target,
+                searchAddress,
+                depth,
+                viaPeer,
+                timeout,
+                cancellationToken);
+        }
+
+        /// <summary>
+        /// Validates all <see cref="Peer"/>s in the routing table by sending a simple message.
+        /// </summary>
+        /// <param name="timeout">Timeout for this operation. If it is set to <c>null</c>,
+        /// wait infinitely until the requested operation is finished.</param>
+        /// <param name="cancellationToken">A cancellation token used to propagate notification
+        /// that this operation should be canceled.</param>
+        /// <returns>An awaitable task without value.</returns>
+        public async Task CheckAllPeersAsync(
+            TimeSpan? timeout = null,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            cancellationToken = CancellationTokenSource
+                .CreateLinkedTokenSource(cancellationToken, _cancellationToken).Token;
+
+            var netMQTransport = (NetMQTransport)Transport;
+            await netMQTransport.CheckAllPeersAsync(cancellationToken, timeout);
         }
 
         internal async Task AddPeersAsync(
@@ -885,9 +863,9 @@ namespace Libplanet.Net
             TimeSpan? timeout,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            if (Protocol is null)
+            if (Transport is null)
             {
-                throw new ArgumentNullException(nameof(Protocol));
+                throw new ArgumentNullException(nameof(Transport));
             }
 
             if (cancellationToken == default(CancellationToken))
@@ -895,392 +873,385 @@ namespace Libplanet.Net
                 cancellationToken = _cancellationToken;
             }
 
-            try
-            {
-                KademliaProtocol kp = (KademliaProtocol)Protocol;
-
-                var tasks = new List<Task>();
-                foreach (Peer peer in peers)
-                {
-                    if (peer is BoundPeer boundPeer)
-                    {
-                        tasks.Add(kp.PingAsync(
-                            boundPeer,
-                            timeout: timeout,
-                            cancellationToken: cancellationToken));
-                    }
-                }
-
-                _logger.Verbose("Trying to ping all {PeersNumber} peers.", tasks.Count);
-                await Task.WhenAll(tasks);
-                _logger.Verbose("Update complete.");
-            }
-            catch (DifferentAppProtocolVersionException)
-            {
-                _logger.Debug("Different version encountered during AddPeersAsync().");
-            }
-            catch (TimeoutException)
-            {
-                _logger.Debug(
-                    $"Timeout occurred during {nameof(AddPeersAsync)}() after {timeout}.");
-                throw;
-            }
-            catch (TaskCanceledException)
-            {
-                _logger.Debug($"Task is cancelled during {nameof(AddPeersAsync)}().");
-            }
-            catch (Exception e)
-            {
-                _logger.Error(
-                    e,
-                    $"Unexpected exception occurred during {nameof(AddPeersAsync)}().");
-                throw;
-            }
+            await ((NetMQTransport)Transport).AddPeersAsync(peers, timeout, cancellationToken);
         }
 
-        internal async Task SendMessageAsync(BoundPeer peer, Message message)
-        {
-            await SendMessageWithReplyAsync(peer, message, TimeSpan.FromSeconds(3), 0);
-        }
-
-        internal virtual async Task<IEnumerable<Message>> SendMessageWithReplyAsync(
+        // FIXME: This would be better if it's merged with GetDemandBlockHashes
+        internal async IAsyncEnumerable<Tuple<long, HashDigest<SHA256>>> GetBlockHashes(
             BoundPeer peer,
-            Message message,
-            TimeSpan? timeout,
-            int expectedResponses,
-            CancellationToken cancellationToken = default(CancellationToken)
+            BlockLocator locator,
+            HashDigest<SHA256>? stop,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default
         )
-        {
-            if (_behindNAT)
-            {
-                await CreatePermission(peer);
-            }
-
-            Guid reqId = Guid.NewGuid();
-            try
-            {
-                _logger.Verbose(
-                    "Enqueue a request {RequestId} to {PeerAddress}: {Message}.",
-                    reqId,
-                    peer.Address,
-                    message
-                );
-                var tcs = new TaskCompletionSource<IEnumerable<Message>>();
-                await _requests.AddAsync(
-                    new MessageRequest(reqId, message, peer, timeout, expectedResponses, tcs)
-                );
-                _logger.Verbose(
-                    "Enqueued a request {RequestId} to {PeerAddress}: {Message}.",
-                    reqId,
-                    peer.Address,
-                    message
-                );
-
-                var reply = (await tcs.Task).ToList();
-                const string logMsg =
-                    "Received {ReplyMessageCount} reply messages to {RequestId} " +
-                    "from {PeerAddress}: {ReplyMessages}.";
-                _logger.Debug(logMsg, reply.Count, reqId, peer.Address, reply);
-
-                return reply;
-            }
-            catch (DifferentAppProtocolVersionException e)
-            {
-                const string logMsg =
-                    "{PeerAddress} sent a reply to {RequestId} with " +
-                    "a different app protocol version; " +
-                    "expected: {ExpectedVersion}; actual: {ActualVersion}.";
-                _logger.Error(e, logMsg, peer.Address, reqId, e.ExpectedVersion, e.ActualVersion);
-                throw;
-            }
-            catch (TimeoutException)
-            {
-                _logger.Debug(
-                    $"{nameof(Swarm<T>)}.{nameof(SendMessageWithReplyAsync)}() timed out " +
-                    "after {Timeout} of waiting a reply to {RequestId} from {PeerAddress}.",
-                    timeout,
-                    reqId,
-                    peer.Address
-                );
-                throw;
-            }
-            catch (TaskCanceledException)
-            {
-                _logger.Debug(
-                    $"{nameof(Swarm<T>)}.{nameof(SendMessageWithReplyAsync)}() was cancelled to " +
-                    "wait a reply to {RequestId} from {PeerAddress}.",
-                    reqId,
-                    peer.Address
-                );
-                throw;
-            }
-            catch (Exception e)
-            {
-                var msg =
-                    $"{nameof(Swarm<T>)}.{nameof(SendMessageWithReplyAsync)}() encountered " +
-                    "an unexpected exception during sending a request {RequestId} to " +
-                    "{PeerAddress} and waiting a reply to it: {Exception}.";
-                _logger.Error(e, msg, reqId, peer.Address, e);
-                throw;
-            }
-        }
-
-        internal async Task<IEnumerable<HashDigest<SHA256>>>
-            GetBlockHashesAsync(
-                BoundPeer peer,
-                BlockLocator locator,
-                HashDigest<SHA256>? stop,
-                CancellationToken token = default(CancellationToken)
-            )
         {
             var request = new GetBlockHashes(locator, stop);
 
-            Message parsedMessage = await (this as ISwarm).SendMessageWithReplyAsync(
+            Message parsedMessage = await Transport.SendMessageWithReplyAsync(
                 peer,
                 request,
                 timeout: BlockHashRecvTimeout,
-                cancellationToken: token
+                cancellationToken: cancellationToken
             );
-
-            Protocol.ReceiveMessage(parsedMessage);
-            ValidateSender(parsedMessage.Remote);
 
             if (parsedMessage is BlockHashes blockHashes)
             {
-                return blockHashes.Hashes;
+                if (blockHashes.StartIndex is long idx)
+                {
+                    HashDigest<SHA256>[] hashes = blockHashes.Hashes.ToArray();
+                    _logger.Debug(
+                        $"Received a {nameof(BlockHashes)} message with an offset index " +
+                        "{OffsetIndex} (total {HashesLength} hashes).",
+                        idx,
+                        hashes.LongLength
+                    );
+                    foreach (HashDigest<SHA256> hash in hashes)
+                    {
+                        yield return new Tuple<long, HashDigest<SHA256>>(idx, hash);
+                        idx++;
+                    }
+                }
+                else
+                {
+                    _logger.Debug(
+                        $"Received a {nameof(BlockHashes)} message, but it has zero hashes."
+                    );
+                }
+
+                yield break;
             }
 
             throw new InvalidMessageException(
-                $"The response of GetBlockHashes isn't BlockHashes. " +
-                $"but {parsedMessage}");
+                $"The response of {nameof(GetBlockHashes)} is expected to be " +
+                $"{nameof(BlockHashes)}, not {parsedMessage.GetType().Name}: {parsedMessage}"
+            );
         }
 
-        internal System.Collections.Async.IAsyncEnumerable<Block<T>> GetBlocksAsync(
+        internal async IAsyncEnumerable<Block<T>> GetBlocksAsync(
             BoundPeer peer,
-            IEnumerable<HashDigest<SHA256>> blockHashes)
+            IEnumerable<HashDigest<SHA256>> blockHashes,
+            [EnumeratorCancellation] CancellationToken cancellationToken
+        )
         {
-            return new AsyncEnumerable<Block<T>>(async yield =>
+            _logger.Information(
+                "Try to download blocks from {EndPoint}@{Address}...",
+                peer.EndPoint,
+                peer.Address.ToHex()
+            );
+
+            var blockHashesAsArray = blockHashes as HashDigest<SHA256>[] ?? blockHashes.ToArray();
+            var request = new GetBlocks(blockHashesAsArray);
+            int hashCount = blockHashesAsArray.Count();
+
+            if (hashCount < 1)
             {
-                CancellationToken yieldToken = yield.CancellationToken;
-                var blockHashesAsArray =
-                    blockHashes as HashDigest<SHA256>[] ??
-                    blockHashes.ToArray();
-                var request = new GetBlocks(blockHashesAsArray);
-                int hashCount = blockHashesAsArray.Count();
+                yield break;
+            }
 
-                if (hashCount < 1)
+            TimeSpan blockRecvTimeout = BlockRecvTimeout + TimeSpan.FromSeconds(hashCount);
+            if (blockRecvTimeout > MaxTimeout)
+            {
+                blockRecvTimeout = MaxTimeout;
+            }
+
+            IEnumerable<Message> replies = await Transport.SendMessageWithReplyAsync(
+                peer,
+                request,
+                blockRecvTimeout,
+                ((hashCount - 1) / request.ChunkSize) + 1,
+                cancellationToken
+            );
+
+            foreach (Message message in replies)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (message is Messages.Blocks blockMessage)
                 {
-                    yield.Break();
-                }
-
-                TimeSpan blockRecvTimeout = BlockRecvTimeout + TimeSpan.FromSeconds(hashCount);
-                if (blockRecvTimeout > MaxTimeout)
-                {
-                    blockRecvTimeout = MaxTimeout;
-                }
-
-                IEnumerable<Message> replies = await SendMessageWithReplyAsync(
-                    peer,
-                    request,
-                    blockRecvTimeout,
-                    ((hashCount - 1) / request.ChunkSize) + 1,
-                    yieldToken
-                );
-
-                foreach (Message message in replies)
-                {
-                    Protocol.ReceiveMessage(message);
-                    ValidateSender(message.Remote);
-                    if (message is Messages.Blocks blockMessage)
+                    IList<byte[]> payloads = blockMessage.Payloads;
+                    _logger.Debug(
+                        "Received {Number} blocks from {Peer}.",
+                        payloads.Count,
+                        message.Remote);
+                    foreach (byte[] payload in payloads)
                     {
-                        IList<byte[]> payloads = blockMessage.Payloads;
-                        _logger.Debug(
-                            "Received {0} blocks from {1}.",
-                            payloads.Count,
-                            message.Remote.PublicKey.ToAddress().ToHex());
-                        foreach (byte[] payload in payloads)
-                        {
-                            Block<T> block = Block<T>.FromBencodex(payload);
-                            await yield.ReturnAsync(block);
-                        }
-                    }
-                    else
-                    {
-                        throw new InvalidMessageException(
-                            $"The response of GetData isn't a Block. " +
-                            $"but {message}");
+                        cancellationToken.ThrowIfCancellationRequested();
+                        Block<T> block = Block<T>.Deserialize(payload);
+
+                        yield return block;
                     }
                 }
-            });
+                else
+                {
+                    throw new InvalidMessageException(
+                        $"Expected a {nameof(Blocks)} message as a response of " +
+                        $"the {nameof(GetBlocks)} message, but got a {message.GetType().Name} " +
+                        $"message instead: {message}"
+                    );
+                }
+            }
+
+            _logger.Information(
+                "Downloaded blocks from {EndPoint}@{Address}.",
+                peer.EndPoint,
+                peer.Address.ToHex()
+            );
         }
 
-        internal System.Collections.Async.IAsyncEnumerable<Transaction<T>> GetTxsAsync(
+        internal async IAsyncEnumerable<Transaction<T>> GetTxsAsync(
             BoundPeer peer,
             IEnumerable<TxId> txIds,
-            CancellationToken cancellationToken = default(CancellationToken))
+            [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            return new AsyncEnumerable<Transaction<T>>(async yield =>
+            var txIdsAsArray = txIds as TxId[] ?? txIds.ToArray();
+            var request = new GetTxs(txIdsAsArray);
+            int txCount = txIdsAsArray.Count();
+
+            _logger.Debug("Required tx count: {Count}.", txCount);
+
+            var txRecvTimeout = TxRecvTimeout + TimeSpan.FromSeconds(txCount);
+            if (txRecvTimeout > MaxTimeout)
             {
-                var txIdsAsArray = txIds as TxId[] ?? txIds.ToArray();
-                var request = new GetTxs(txIdsAsArray);
-                int txCount = txIdsAsArray.Count();
+                txRecvTimeout = MaxTimeout;
+            }
 
-                _logger.Debug("Required tx count: {Count}.", txCount);
+            IEnumerable<Message> replies = await Transport.SendMessageWithReplyAsync(
+                peer,
+                request,
+                txRecvTimeout,
+                txCount,
+                cancellationToken
+            );
 
-                var txRecvTimeout = TxRecvTimeout + TimeSpan.FromSeconds(txCount);
-                if (txRecvTimeout > MaxTimeout)
+            foreach (Message message in replies)
+            {
+                if (message is Messages.Tx parsed)
                 {
-                    txRecvTimeout = MaxTimeout;
+                    Transaction<T> tx = Transaction<T>.Deserialize(parsed.Payload);
+                    yield return tx;
                 }
-
-                IEnumerable<Message> replies = await SendMessageWithReplyAsync(
-                    peer,
-                    request,
-                    txRecvTimeout,
-                    txCount,
-                    cancellationToken
-                );
-
-                foreach (Message message in replies)
+                else
                 {
-                    Protocol.ReceiveMessage(message);
-                    ValidateSender(message.Remote);
-                    if (message is Messages.Tx parsed)
-                    {
-                        Transaction<T> tx = Transaction<T>.FromBencodex(
-                            parsed.Payload);
-                        await yield.ReturnAsync(tx);
-                    }
-                    else
-                    {
-                        throw new InvalidMessageException(
-                            $"The response of GetTxs should be Tx, not {message}.");
-                    }
+                    throw new InvalidMessageException(
+                        $"Expected {nameof(Tx)} messages as response of " +
+                        $"the {nameof(GetTxs)} message, but got a {message.GetType().Name} " +
+                        $"message instead: {message}"
+                    );
                 }
-            });
+            }
         }
 
-        private void BroadcastBlocks(Address? except, IEnumerable<Block<T>> blocks)
+        private void BroadcastBlock(Address? except, Block<T> block)
         {
             _logger.Debug("Trying to broadcast blocks...");
-            var message = new BlockHashes(
-                Address,
-                blocks.Select(b => b.Hash)
-            );
+            var message = new BlockHeaderMessage(block.GetBlockHeader());
             BroadcastMessage(except, message);
             _logger.Debug("Block broadcasting complete.");
         }
 
-        private void BroadcastTxs(Address? excpet, IEnumerable<Transaction<T>> txs)
+        private void BroadcastTxs(Address? except, IEnumerable<Transaction<T>> txs)
         {
-            _logger.Debug("Broadcast Txs.");
             List<TxId> txIds = txs.Select(tx => tx.Id).ToList();
-            BroadcastTxIds(excpet, txIds);
+            _logger.Debug("Broadcast {TransactionsNumber} txs...", txIds.Count);
+            BroadcastTxIds(except, txIds);
         }
 
         private void BroadcastMessage(Address? except, Message message)
         {
-            _broadcastQueue.Enqueue((except, message));
+            Transport.BroadcastMessage(except, message);
         }
 
-        private async Task BindingProxies(CancellationToken cancellationToken)
+        private Task<(BoundPeer, Pong)[]> DialToExistingPeers(
+            TimeSpan? dialTimeout,
+            CancellationToken cancellationToken
+        )
         {
-            while (!cancellationToken.IsCancellationRequested)
+            IEnumerable<Task<(BoundPeer, Pong)>> tasks = Peers.Select(
+                peer => Transport.SendMessageWithReplyAsync(
+                    peer, new Ping(), dialTimeout, cancellationToken
+                ).ContinueWith<(BoundPeer, Pong)>(
+                    t =>
+                    {
+                        if (t.IsFaulted || t.IsCanceled || !(t.Result is Pong pong))
+                        {
+                            switch (t.Exception?.InnerException)
+                            {
+                                case TimeoutException te:
+                                    _logger.Debug(
+                                        $"TimeoutException occurred during dial to ({peer})."
+                                    );
+                                    break;
+                                case DifferentAppProtocolVersionException dapve:
+                                    _logger.Error(
+                                        dapve,
+                                        $"Protocol Version is different ({peer}).");
+                                    break;
+                                case Exception e:
+                                    _logger.Error(
+                                        e,
+                                        $"An unexpected exception occurred during dial to ({peer})."
+                                    );
+                                    break;
+                                default:
+                                    break;
+                            }
+
+                            // Mark to skip
+                            return (null, null);
+                        }
+                        else
+                        {
+                            return (peer, pong);
+                        }
+                    },
+                    cancellationToken
+                )
+            );
+
+            return Task.WhenAll(tasks).ContinueWith(
+                t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        throw t.Exception;
+                    }
+
+                    return t.Result.Where(pair => !(pair.Item1 is null)).ToArray();
+                },
+                cancellationToken
+            );
+        }
+
+        private async IAsyncEnumerable<(long, HashDigest<SHA256>)> GetDemandBlockHashes(
+            BlockChain<T> blockChain,
+            IList<(BoundPeer, long?)> peersWithHeight,
+            IProgress<PreloadState> progress,
+            [EnumeratorCancellation] CancellationToken cancellationToken
+        )
+        {
+            long currentTipIndex = blockChain.Tip?.Index ?? -1;
+            BlockLocator locator = blockChain.GetBlockLocator();
+            int peersCount = peersWithHeight.Count;
+            int i = 0;
+            var exceptions = new List<Exception>();
+            foreach ((BoundPeer peer, long? peerHeight) in peersWithHeight)
             {
+                i++;
+                long peerIndex = peerHeight ?? -1;
+
+                if (peer is null || currentTipIndex >= peerIndex)
+                {
+                    continue;
+                }
+
+                long totalBlocksToDownload = peerIndex - currentTipIndex;
+                var pairsToYield = new List<Tuple<long, HashDigest<SHA256>>>();
+                Exception error = null;
                 try
                 {
-#pragma warning disable IDE0067  // We'll dispose of `stream` in proxy task.
-                    NetworkStream stream = await _turnClient.AcceptRelayedStreamAsync();
-#pragma warning restore IDE0067
-
-                    // TODO We should expose the interface so that library users
-                    // can limit / manage the task.
-#pragma warning disable CS4014
-                    Task.Run(async () =>
+                    var downloaded = new List<HashDigest<SHA256>>();
+                    while (downloaded.Count < totalBlocksToDownload)
                     {
-                        using (var proxy = new NetworkStreamProxy(stream))
+                        _logger.Verbose(
+                            "Request block hashes to {Peer} (height: {PeerHeight}) using " +
+                            "the locator {@Locator}... ({CurrentIndex}/{EstimatedTotalCount})",
+                            peer,
+                            peerHeight,
+                            locator.Select(h => h.ToString()),
+                            downloaded.Count,
+                            totalBlocksToDownload
+                        );
+
+                        IAsyncEnumerable<Tuple<long, HashDigest<SHA256>>> blockHashes =
+                            GetBlockHashes(peer, locator, null, cancellationToken);
+                        await foreach (Tuple<long, HashDigest<SHA256>> pair in blockHashes)
                         {
-                            await proxy.StartAsync(IPAddress.Loopback, _listenPort.Value);
+                            pair.Deconstruct(out long dlIndex, out HashDigest<SHA256> dlHash);
+                            _logger.Verbose(
+                                "Received a block hash from {Peer}: #{BlockIndex} {BlockHash}",
+                                peer,
+                                dlIndex,
+                                dlHash
+                            );
+
+                            if (downloaded.Contains(dlHash) || blockChain.ContainsBlock(dlHash))
+                            {
+                                continue;
+                            }
+
+                            downloaded.Add(dlHash);
+
+                            // As C# disallows to yield return inside try-catch block,
+                            // we need to work around the limitation by having this buffer.
+                            pairsToYield.Add(pair);
+                            progress?.Report(
+                                new BlockHashDownloadState
+                                {
+                                    EstimatedTotalBlockHashCount = Math.Max(
+                                        totalBlocksToDownload,
+                                        downloaded.Count),
+                                    ReceivedBlockHashCount = downloaded.Count,
+                                    SourcePeer = peer,
+                                }
+                            );
                         }
-                    }).ContinueWith(_ => stream.Dispose());
-#pragma warning restore CS4014
+
+                        locator = new BlockLocator(
+                            idx =>
+                            {
+                                if (idx < 0)
+                                {
+                                    idx = currentTipIndex + downloaded.Count + 1 + idx;
+                                }
+
+                                if (idx <= currentTipIndex)
+                                {
+                                    return blockChain.Store.IndexBlockHash(blockChain.Id, idx);
+                                }
+
+                                int relIdx = (int)(idx - currentTipIndex - 1);
+                                return downloaded[relIdx];
+                            },
+                            hash => blockChain.Store.GetBlock<T>(hash) is Block<T> b
+                                ? b.Index
+                                : currentTipIndex + 1 + downloaded.IndexOf(hash)
+                        );
+                    }
                 }
                 catch (Exception e)
                 {
-                    _logger.Error(e, "An unexpected exception occurred. try again...");
+                    error = e;
                 }
-            }
-        }
 
-        private System.Collections.Async.IAsyncEnumerable<(BoundPeer, Pong)> DialToExistingPeers(
-            TimeSpan? dialTimeout,
-            CancellationToken cancellationToken)
-        {
-            return new AsyncEnumerable<(BoundPeer, Pong)>(async yield =>
-            {
-                foreach (BoundPeer peer in Peers)
+                foreach (Tuple<long, HashDigest<SHA256>> pair in pairsToYield)
                 {
-                    try
-                    {
-                        Message reply = await (this as ISwarm).SendMessageWithReplyAsync(
-                            peer,
-                            new Ping(),
-                            dialTimeout,
-                            cancellationToken
-                        );
-                        if (reply is Pong pong)
-                        {
-                            Protocol.ReceiveMessage(reply);
-                            await yield.ReturnAsync((peer, pong));
-                        }
-                    }
-                    catch (TimeoutException)
-                    {
-                        _logger.Debug($"TimeoutException occurred during dial to ({peer}).");
-                    }
-                    catch (IOException e)
-                    {
-                        _logger.Error(
-                            e,
-                            $"IOException occurred ({peer})."
-                        );
-                    }
-                    catch (DifferentAppProtocolVersionException e)
-                    {
-                        _logger.Error(
-                            e,
-                            $"Protocol Version is different ({peer}).");
-                    }
+                    yield return pair.ToValueTuple();
                 }
-            });
-        }
 
-        private async Task SyncBehindsBlocksFromPeerAsync(
-            BlockChain<T> blockChain,
-            (BoundPeer, long?) peerWithLength,
-            IProgress<BlockDownloadState> progress,
-            CancellationToken cancellationToken,
-            bool render
-        )
-        {
-            if (peerWithLength.Item1 != null &&
-                !(blockChain.Tip?.Index >= (peerWithLength.Item2 ?? -1)))
-            {
-                long currentTipIndex = blockChain.Tip?.Index ?? -1;
-                long peerIndex = peerWithLength.Item2 ?? -1;
-                long totalBlockCount = peerIndex - currentTipIndex;
+                if (error is null)
+                {
+                    break;
+                }
 
-                _logger.Debug("Synchronizing previous blocks from " +
-                    $"[{peerWithLength.Item1.Address.ToHex()}]");
-                await SyncPreviousBlocksAsync(
-                    blockChain,
-                    peerWithLength.Item1,
-                    null,
-                    progress,
-                    totalBlockCount,
-                    evaluateActions: render,
-                    cancellationToken: cancellationToken
-                );
+                exceptions.Add(error);
+                if (i == peersCount)
+                {
+                    BoundPeer[] peers = peersWithHeight.Select(p => p.Item1).ToArray();
+                    _logger.Warning(
+                        error,
+                        "Failed to fetch demand block hashes from peers: {Peers}",
+                        peers
+                    );
+                    throw new AggregateException(
+                        "Failed to fetch demand block hashes from peers: " +
+                        string.Join(", ", peers.Select(p => p.ToString())),
+                        exceptions
+                    );
+                }
+
+                const string message =
+                    "Failed to fetch demand block hashes from {Peer}; " +
+                    "retry with another peer...\n";
+                _logger.Debug(error, message, peer, error);
             }
         }
 
@@ -1313,15 +1284,13 @@ namespace Libplanet.Net
                     Message reply;
                     try
                     {
-                        reply = await (this as ISwarm).SendMessageWithReplyAsync(
+                        reply = await Transport.SendMessageWithReplyAsync(
                             peer,
                             request,
                             timeout: RecentStateRecvTimeout,
                             cancellationToken: cancellationToken
                         );
 
-                        // Do not call Protocol.ReceiveMessage since swarm is not started
-                        // when synchronizing previous states.
                         _logger.Debug("Received recent states from a peer ({Peer}).", peer);
                     }
                     catch (TimeoutException e)
@@ -1332,8 +1301,6 @@ namespace Libplanet.Net
                         );
                         break;
                     }
-
-                    ValidateSender(reply.Remote);
 
                     if (reply is RecentStates recentStates && !recentStates.Missing)
                     {
@@ -1372,10 +1339,12 @@ namespace Libplanet.Net
                             foreach (KeyValuePair<HashDigest<SHA256>, ISet<Address>> pair in d)
                             {
                                 HashDigest<SHA256> hash = pair.Key;
-                                IImmutableSet<Address> addresses = pair.Value.ToImmutableHashSet();
+                                IImmutableSet<string> stateKeys = pair.Value
+                                    .Select(a => a.ToHex().ToLowerInvariant())
+                                    .ToImmutableHashSet();
                                 if (_store.GetBlockIndex(hash) is long index)
                                 {
-                                    _store.StoreStateReference(chainId, addresses, hash, index);
+                                    _store.StoreStateReference(chainId, stateKeys, hash, index);
                                 }
                             }
 
@@ -1385,7 +1354,12 @@ namespace Libplanet.Net
                             foreach (var pair in recentStates.BlockStates)
                             {
                                 cancellationToken.ThrowIfCancellationRequested();
-                                _store.SetBlockStates(pair.Key, pair.Value);
+                                IImmutableDictionary<string, IValue> states =
+                                    pair.Value.ToImmutableDictionary(
+                                        kv => kv.Key.ToHex().ToLowerInvariant(),
+                                        kv => kv.Value
+                                    );
+                                _store.SetBlockStates(pair.Key, states);
                             }
 
                             progress?.Report(new StateDownloadState()
@@ -1472,58 +1446,6 @@ namespace Libplanet.Net
             _logger.Debug("Finished to execute actions.");
         }
 
-        private async Task RefreshAllocate(CancellationToken cancellationToken)
-        {
-            TimeSpan lifetime = TurnAllocationLifetime;
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(lifetime - TimeSpan.FromMinutes(1), cancellationToken);
-                    lifetime = await _turnClient.RefreshAllocationAsync(lifetime);
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-                catch (OperationCanceledException e)
-                {
-                    _logger.Warning(e, $"{nameof(RefreshAllocate)}() is cancelled.");
-                    throw;
-                }
-                catch (Exception e)
-                {
-                    _logger.Error(
-                        e,
-                        $"An unexpected exception occurred during {nameof(RefreshAllocate)}(): {e}"
-                    );
-                }
-            }
-        }
-
-        private async Task RefreshPermissions(
-            CancellationToken cancellationToken)
-        {
-            TimeSpan lifetime = TurnPermissionLifetime;
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(lifetime - TimeSpan.FromMinutes(1), cancellationToken);
-                    await Task.WhenAll(Peers.Select(CreatePermission));
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-                catch (OperationCanceledException e)
-                {
-                    _logger.Warning(e, $"{nameof(RefreshPermissions)}() is cancelled.");
-                    throw;
-                }
-                catch (Exception e)
-                {
-                    var msg = "An unexpected exception occurred during " +
-                              $"{nameof(RefreshPermissions)}(): {{0}}";
-                    _logger.Error(e, msg, e);
-                }
-            }
-        }
-
         private async Task BroadcastTxAsync(
             TimeSpan broadcastTxInterval,
             CancellationToken cancellationToken)
@@ -1571,16 +1493,20 @@ namespace Libplanet.Net
             BroadcastMessage(except, message);
         }
 
-        private async Task ProcessMessageAsync(
-            Message message,
-            CancellationToken cancellationToken)
+        private void ProcessMessageHandler(object target, Message message)
         {
-            Protocol.ReceiveMessage(message);
             switch (message)
             {
                 case Ping ping:
                     {
                         _logger.Debug($"Ping received.");
+
+                        Pong pong = new Pong(BlockChain.Tip?.Index)
+                        {
+                            Identity = ping.Identity,
+                        };
+
+                        Transport.ReplyMessage(pong);
                         break;
                     }
 
@@ -1592,16 +1518,19 @@ namespace Libplanet.Net
 
                 case GetBlockHashes getBlockHashes:
                     {
-                        IEnumerable<HashDigest<SHA256>> hashes =
-                            BlockChain.FindNextHashes(
-                                getBlockHashes.Locator,
-                                getBlockHashes.Stop,
-                                FindNextHashesChunkSize);
-                        var reply = new BlockHashes(Address, hashes)
+                        BlockChain.FindNextHashes(
+                            getBlockHashes.Locator,
+                            getBlockHashes.Stop,
+                            FindNextHashesChunkSize
+                        ).Deconstruct(
+                            out long? offset,
+                            out IReadOnlyList<HashDigest<SHA256>> hashes
+                        );
+                        var reply = new BlockHashes(offset, hashes)
                         {
                             Identity = getBlockHashes.Identity,
                         };
-                        (this as ISwarm).ReplyMessage(reply);
+                        Transport.ReplyMessage(reply);
                         break;
                     }
 
@@ -1625,13 +1554,21 @@ namespace Libplanet.Net
 
                 case TxIds txIds:
                     {
-                        await ProcessTxIds(txIds, cancellationToken);
+                        ProcessTxIds(txIds);
                         break;
                     }
 
                 case BlockHashes blockHashes:
                     {
-                        await ProcessBlockHashes(blockHashes, cancellationToken);
+                        _logger.Error("BlockHashes message is only for IBD.");
+                        break;
+                    }
+
+                case BlockHeaderMessage blockHeader:
+                    {
+                        Task.Run(
+                            async () => await ProcessBlockHeader(blockHeader, _cancellationToken),
+                            _cancellationToken);
                         break;
                     }
 
@@ -1640,75 +1577,47 @@ namespace Libplanet.Net
             }
         }
 
-        private async Task ProcessBlockHashes(
-            BlockHashes message,
+        private async Task ProcessBlockHeader(
+            BlockHeaderMessage message,
             CancellationToken cancellationToken = default(CancellationToken))
         {
             if (!(message.Remote is BoundPeer peer))
             {
                 _logger.Information(
-                    "BlockHashes was sent from invalid peer " +
-                    $"[{message.Remote.Address.ToHex()}]. ignored.");
+                    "BlockHeaderMessage was sent from invalid peer " +
+                    "{PeerAddress}; ignored.",
+                    message.Remote.Address);
                 return;
             }
 
-            ImmutableList<HashDigest<SHA256>> newHashes = message.Hashes
-                .Where(hash => !_store.ContainsBlock(hash))
-                .ToImmutableList();
-
-            if (!newHashes.Any())
-            {
-                _logger.Debug($"No blocks to require. Ignore {nameof(BlockHashes)}.");
-                return;
-            }
+            BlockHeaderReceived.Set();
+            BlockHeader header = message.Header;
 
             _logger.Debug(
-                $"Trying to {nameof(GetBlocksAsync)}() using {{0}} hashes.",
-                newHashes.Count);
+                "Block header of hash [{Hash}] (index: {Index}) received.",
+                ByteUtil.Hex(header.Hash),
+                header.Index,
+                Address.ToHex());
 
-            System.Collections.Async.IAsyncEnumerable<Block<T>> fetched = GetBlocksAsync(
-                peer,
-                newHashes
-            );
-
-            List<Block<T>> blocks = await fetched.ToListAsync(
-                cancellationToken
-            );
-            _logger.Debug($"{nameof(GetBlocksAsync)}() complete.");
-
-            if (!blocks.Any())
+            using (await _blockSyncMutex.LockAsync(cancellationToken))
             {
-                _logger.Debug("No blocks fetched.");
-                return;
-            }
-
-            LastReceived = DateTimeOffset.UtcNow;
-            BlockReceived.Set();
-
-            try
-            {
-                using (await _blockSyncMutex.LockAsync(cancellationToken))
+                // FIXME: this should be changed into total difficulty.
+                if (header.Index > BlockChain.Tip.Index &&
+                    (_demandBlockHash is null || _demandBlockHash.Value.Item1 < header.Index))
                 {
-                    if (await AppendBlocksAsync(peer, blocks, cancellationToken))
-                    {
-                        BroadcastBlocks(message.Remote.Address, blocks);
-                    }
-
-                    _logger.Debug("Append complete.");
+                    _demandBlockHash =
+                        (header.Index, peer, new HashDigest<SHA256>(header.Hash.ToArray()));
                 }
-            }
-            catch (TimeoutException)
-            {
-                // As we have more chances, ignore this.
-                _logger.Debug($"Timeout occurred during {nameof(ProcessBlockHashes)}().");
-            }
-            catch (Exception e)
-            {
-                _logger.Error(
-                    e,
-                    $"Append failed during {nameof(ProcessBlockHashes)}() due to exception: {{0}}",
-                    e);
-                throw;
+                else
+                {
+                    _logger.Debug(
+                        "No blocks are required " +
+                        "(current: {Current}, demand: {Demand}, received: {Received});" +
+                        $" {nameof(BlockHeaderMessage)} is ignored.",
+                        BlockChain.Tip.Index,
+                        _demandBlockHash?.Item1,
+                        header.Index);
+                }
             }
         }
 
@@ -1775,89 +1684,11 @@ namespace Libplanet.Net
             }
             finally
             {
-                if (synced is BlockChain<T> syncedNotNull)
+                if (synced is BlockChain<T> syncedNotNull
+                    && !syncedNotNull.Id.Equals(blockChain?.Id))
                 {
-                    if (syncedNotNull.Id.Equals(blockChain?.Id))
-                    {
-                        if (evaluateActions)
-                        {
-                            blockChain.RenderBlocks(previousTipIndex + 1);
-                        }
-                    }
-                    else
-                    {
-                        blockChain.Swap(synced, evaluateActions);
-                    }
+                    blockChain.Swap(synced, evaluateActions);
                 }
-            }
-        }
-
-        private async Task<bool> AppendBlocksAsync(
-            BoundPeer peer,
-            List<Block<T>> blocks,
-            CancellationToken cancellationToken
-        )
-        {
-            // We assume that the blocks are sorted in order.
-            Block<T> oldest = blocks.First();
-            Block<T> latest = blocks.Last();
-            Block<T> tip = BlockChain.Tip;
-
-            if (tip is null || latest.Index > tip.Index)
-            {
-                List<Block<T>> blocksToAppend;
-                if (oldest.PreviousHash is null)
-                {
-                    _logger.Debug("The oldest block[{block}] seems to be genesis.", oldest);
-                    blocksToAppend = blocks;
-                }
-                else if (!(tip is null) &&
-                         blocks.Any(block => block.PreviousHash.Equals(tip.Hash)))
-                {
-                    // FIXME: This may not work as expected in multi-miner environment.
-                    _logger.Debug("Does not need to fill.");
-                    blocksToAppend = blocks.Where(block => block.Index > tip.Index).ToList();
-                }
-                else
-                {
-                    _logger.Debug("Trying to fill up previous blocks...");
-                    await SyncPreviousBlocksAsync(
-                        BlockChain,
-                        peer,
-                        oldest.PreviousHash,
-                        null,
-                        blocks.Count,
-                        evaluateActions: true,
-                        cancellationToken: cancellationToken
-                    );
-                    _logger.Debug("Filled up; trying to concatenation...");
-                    blocksToAppend = blocks;
-                }
-
-                foreach (Block<T> block in blocksToAppend)
-                {
-                    BlockChain.Append(block);
-                }
-
-                _logger.Debug("Sync is done.");
-
-                BlockAppended.Set();
-
-                var blockHashes =
-                    blocks.Aggregate(string.Empty, (current, block) =>
-                        current + $"[{block.Hash.ToString()}]");
-                _logger.Debug(
-                    $"Re-broadcast {nameof(BlockHashes)} with {{0}} blocks, which are {{1}}.",
-                    blocks.Count,
-                    blockHashes);
-                return true;
-            }
-            else
-            {
-                _logger.Information(
-                    "Received index is older than current chain's tip." +
-                    " ignored.");
-                return false;
             }
         }
 
@@ -1874,6 +1705,7 @@ namespace Libplanet.Net
         {
             BlockChain<T> workspace = blockChain;
             var scope = new List<Guid>();
+            bool renderActions = evaluateActions;
 
             try
             {
@@ -1884,22 +1716,30 @@ namespace Libplanet.Net
                     _logger.Debug("Trying to find branchpoint...");
                     BlockLocator locator = workspace.GetBlockLocator();
                     _logger.Debug("Locator's count: {LocatorCount}", locator.Count());
-                    IEnumerable<HashDigest<SHA256>> hashes = (
-                        await GetBlockHashesAsync(peer, locator, stop, cancellationToken)
-                    ).ToArray();
+                    IAsyncEnumerable<Tuple<long, HashDigest<SHA256>>> hashesAsync =
+                        GetBlockHashes(peer, locator, stop, cancellationToken);
+                    IEnumerable<Tuple<long, HashDigest<SHA256>>> hashes =
+                        await hashesAsync.ToArrayAsync();
 
                     if (!hashes.Any())
                     {
                         _logger.Debug(
                             "Peer [{0}] didn't return any hashes; ignored.",
-                            peer.PublicKey.ToAddress().ToHex()
+                            peer.Address.ToHex()
                         );
                         return workspace;
                     }
 
-                    HashDigest<SHA256> branchPoint = hashes.First();
+                    hashes.First().Deconstruct(
+                        out long branchIndex,
+                        out HashDigest<SHA256> branchPoint
+                    );
 
-                    _logger.Debug("Branchpoint is {0}.", ByteUtil.Hex(branchPoint.ToByteArray()));
+                    _logger.Debug(
+                        "Branch point is #{BranchIndex} {BranchHash}.",
+                        branchIndex,
+                        branchPoint
+                    );
 
                     if (tip is null || branchPoint.Equals(tip.Hash))
                     {
@@ -1910,11 +1750,16 @@ namespace Libplanet.Net
                     // same genesis block...
                     else if (!BlockChain.ContainsBlock(branchPoint))
                     {
+                        // FIXME: This behavior can unexpectedly terminate the swarm (and the game
+                        // app) if it encounters a peer having a different blockchain, and therefore
+                        // can be exploited to remotely shut down other nodes as well.
+                        // Since the intention of this behavior is to prevent mistakes to try to
+                        // connect incorrect seeds (by a user), this behavior should be limited for
+                        // only seed peers.
                         var msg =
                             $"Since the genesis block is fixed to {BlockChain.Genesis} " +
                             "protocol-wise, the blockchain which does not share " +
                             "any mutual block is not acceptable.";
-                        _logger.Debug(msg);
                         throw new InvalidGenesisBlockException(
                             branchPoint,
                             workspace.Genesis.Hash,
@@ -1924,7 +1769,10 @@ namespace Libplanet.Net
                     {
                         _logger.Debug("Forking needed. Trying to fork...");
                         workspace = workspace.Fork(branchPoint);
-                        scope.Add(workspace.Id);
+                        IStore workStore = workspace.Store;
+                        Guid workChainId = workspace.Id;
+                        scope.Add(workChainId);
+                        renderActions = false;
                         _logger.Debug("Forking complete.");
                     }
 
@@ -1936,7 +1784,7 @@ namespace Libplanet.Net
                     _logger.Debug("Trying to fill up previous blocks...");
 
                     var hashesAsArray =
-                        hashes as HashDigest<SHA256>[] ?? hashes.ToArray();
+                        hashes as Tuple<long, HashDigest<SHA256>>[] ?? hashes.ToArray();
                     if (!hashesAsArray.Any())
                     {
                         break;
@@ -1950,35 +1798,42 @@ namespace Libplanet.Net
 
                     totalBlockCount = Math.Max(totalBlockCount, receivedBlockCount + hashCount);
 
-                    await GetBlocksAsync(peer, hashesAsArray)
-                        .ForEachAsync(
-                            block =>
-                            {
-                                _logger.Debug(
-                                    $"Trying to append block[{block.Hash}]...");
+                    IAsyncEnumerable<Block<T>> blocks = GetBlocksAsync(
+                        peer,
+                        hashesAsArray.Select(pair => pair.Item2),
+                        cancellationToken
+                    );
 
-                                cancellationToken.ThrowIfCancellationRequested();
+                    await foreach (Block<T> block in blocks)
+                    {
+                        _logger.Debug(
+                            "Try to append a block #{BlockIndex} {BlockHash}...",
+                            block.Index,
+                            block.Hash
+                        );
 
-                                // As actions in this block should be rendered
-                                // after actions in stale blocks are unrendered,
-                                // given the `render: false` option here.
-                                workspace.Append(
-                                    block,
-                                    DateTimeOffset.UtcNow,
-                                    evaluateActions: evaluateActions,
-                                    renderActions: false
-                                );
-                                receivedBlockCount++;
-                                progress?.Report(new BlockDownloadState
-                                {
-                                    TotalBlockCount = totalBlockCount,
-                                    ReceivedBlockCount = receivedBlockCount,
-                                    ReceivedBlockHash = block.Hash,
-                                    SourcePeer = peer,
-                                });
-                                _logger.Debug($"Block[{block.Hash}] is appended.");
-                            },
-                            cancellationToken);
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        workspace.Append(
+                            block,
+                            DateTimeOffset.UtcNow,
+                            evaluateActions: evaluateActions,
+                            renderActions: renderActions
+                        );
+                        receivedBlockCount++;
+                        progress?.Report(new BlockDownloadState
+                        {
+                            TotalBlockCount = totalBlockCount,
+                            ReceivedBlockCount = receivedBlockCount,
+                            ReceivedBlockHash = block.Hash,
+                            SourcePeer = peer,
+                        });
+                        _logger.Debug(
+                            "Block #{BlockIndex} {BlockHash} was appended.",
+                            block.Index,
+                            block.Hash
+                        );
+                    }
                 }
             }
             catch
@@ -2009,17 +1864,15 @@ namespace Libplanet.Net
 
             foreach (Transaction<T> tx in txs)
             {
-                Message response = new Messages.Tx(tx.ToBencodex(true))
+                Message response = new Messages.Tx(tx.Serialize(true))
                 {
                     Identity = getTxs.Identity,
                 };
-                (this as ISwarm).ReplyMessage(response);
+                Transport.ReplyMessage(response);
             }
         }
 
-        private async Task ProcessTxIds(
-            TxIds message,
-            CancellationToken cancellationToken = default(CancellationToken))
+        private void ProcessTxIds(TxIds message)
         {
             if (!(message.Remote is BoundPeer peer))
             {
@@ -2029,12 +1882,12 @@ namespace Libplanet.Net
                 return;
             }
 
-            _logger.Debug("Trying to fetch txs...");
             _logger.Debug(
                 "Received TxIds: [{txIds}]",
                 string.Join(", ", message.Ids));
 
             ImmutableHashSet<TxId> newTxIds = message.Ids
+                .Where(id => !_demandTxIds.ContainsKey(id))
                 .Where(id => !_store.ContainsTransaction(id))
                 .ToImmutableHashSet();
 
@@ -2044,24 +1897,11 @@ namespace Libplanet.Net
                 return;
             }
 
-            List<Transaction<T>> txs;
-            try
+            _logger.Debug("Txs to require: {@txIds}", newTxIds.Select(txid => txid.ToString()));
+            foreach (var txid in newTxIds)
             {
-                System.Collections.Async.IAsyncEnumerable<Transaction<T>> fetched = GetTxsAsync(
-                    peer, newTxIds, cancellationToken);
-                txs = await fetched.ToListAsync(cancellationToken);
+                _demandTxIds.TryAdd(txid, peer);
             }
-            catch (TimeoutException)
-            {
-                _logger.Debug($"Timeout occurred during {nameof(ProcessTxIds)}().");
-                return;
-            }
-
-            BlockChain.StageTransactions(txs.ToImmutableHashSet());
-            TxReceived.Set();
-            _logger.Debug("Txs staged successfully.");
-
-            BroadcastTxs(message.Remote.Address, txs);
         }
 
         private void TransferBlocks(GetBlocks getData)
@@ -2083,7 +1923,7 @@ namespace Libplanet.Net
                 if (_store.ContainsBlock(hash))
                 {
                     Block<T> block = _store.GetBlock<T>(hash);
-                    byte[] payload = block.ToBencodex(true, true);
+                    byte[] payload = block.Serialize();
                     blocks.Add(payload);
                 }
 
@@ -2098,7 +1938,7 @@ namespace Libplanet.Net
                         i,
                         total
                     );
-                    (this as ISwarm).ReplyMessage(response);
+                    Transport.ReplyMessage(response);
                     blocks.Clear();
                 }
 
@@ -2117,7 +1957,7 @@ namespace Libplanet.Net
                     total,
                     identityHex
                 );
-                (this as ISwarm).ReplyMessage(response);
+                Transport.ReplyMessage(response);
             }
 
             _logger.Debug("Blocks were transferred to {Identity}.", identityHex);
@@ -2131,8 +1971,7 @@ namespace Libplanet.Net
             IImmutableDictionary<HashDigest<SHA256>,
                 IImmutableDictionary<Address, IValue>
             > blockStates = null;
-            IImmutableDictionary<Address, IImmutableList<HashDigest<SHA256>>>
-                stateRefs = null;
+            IImmutableDictionary<string, IImmutableList<HashDigest<SHA256>>> stateRefs = null;
             long nextOffset = -1;
             int iteration = 0;
 
@@ -2178,21 +2017,30 @@ namespace Libplanet.Net
                         lowestIndex: lowestIndex,
                         highestIndex: highestIndex
                     );
-                    _logger.Verbose(
-                        "List state references from {From} to {To}.",
-                        lowestIndex,
-                        highestIndex);
+                    if (_logger.IsEnabled(LogEventLevel.Verbose))
+                    {
+                        _logger.Verbose(
+                            "List state references from {From} to {To}:\n{StateReferences}",
+                            lowestIndex,
+                            highestIndex,
+                            string.Join(
+                                "\n",
+                                stateRefs.Select(kv => $"{kv.Key}: {string.Join(", ", kv.Value)}")
+                            )
+                        );
+                    }
 
                     // GetBlockStates may return null since swarm may not have deep states.
                     blockStates = stateRefs.Values
                         .Select(refs => refs.Last())
-                        .Select(bh =>
-                            new KeyValuePair<
-                                HashDigest<SHA256>,
-                                IImmutableDictionary<Address, IValue>
-                            >(bh, _store.GetBlockStates(bh)))
-                        .Where(kv => !(kv.Value is null))
-                        .ToImmutableDictionary();
+                        .ToImmutableHashSet()
+                        .Select(bh => (bh, _store.GetBlockStates(bh)))
+                        .Where(pair => !(pair.Item2 is null))
+                        .ToImmutableDictionary(
+                            pair => pair.Item1,
+                            pair => (IImmutableDictionary<Address, IValue>)pair.Item2
+                                .ToImmutableDictionary(kv => new Address(kv.Key), kv => kv.Value)
+                        );
                 }
                 finally
                 {
@@ -2212,7 +2060,7 @@ namespace Libplanet.Net
                         "State references to send (preload): {StateReferences} ({Base}-{Target})",
                         stateRefs.Select(kv =>
                             (
-                                kv.Key.ToString(),
+                                kv.Key,
                                 string.Join(", ", kv.Value.Select(v => v.ToString()))
                             )
                         ).ToArray(),
@@ -2221,7 +2069,7 @@ namespace Libplanet.Net
                     );
                     _logger.Verbose(
                         "Block states to send (preload): {BlockStates} ({Base}-{Target})",
-                        blockStates.Select(kv => (kv.Key.ToString(), kv.Value)).ToArray(),
+                        blockStates.Select(kv => (kv.Key, kv.Value)).ToArray(),
                         baseString,
                         targetString
                     );
@@ -2232,401 +2080,159 @@ namespace Libplanet.Net
                 }
             }
 
-            var reply = new RecentStates(target, nextOffset, iteration, blockStates, stateRefs)
+            var reply = new RecentStates(
+                target,
+                nextOffset,
+                iteration,
+                blockStates,
+                stateRefs.ToImmutableDictionary(kv => new Address(kv.Key), kv => kv.Value))
             {
                 Identity = getRecentStates.Identity,
             };
-            (this as ISwarm).ReplyMessage(reply);
+
+            Transport.ReplyMessage(reply);
         }
 
-        private void ReceiveMessage(object sender, NetMQSocketEventArgs e)
-        {
-            try
-            {
-                NetMQMessage raw = e.Socket.ReceiveMultipartMessage();
-
-                _logger.Verbose(
-                    "A raw message [frame count: {0}] has received.",
-                    raw.FrameCount
-                );
-                Message message = Message.Parse(raw, reply: false);
-                _logger.Debug("A message has parsed: {0}, from {1}", message, message.Remote);
-                if (!(message is Ping))
-                {
-                    ValidateSender(message.Remote);
-                }
-
-                // it's still async because some method it relies are async yet.
-                Task.Run(
-                    async () =>
-                    {
-                        try
-                        {
-                            await ProcessMessageAsync(message, _cancellationToken);
-                        }
-                        catch (Exception exc)
-                        {
-                            _logger.Error(
-                                exc,
-                                "Something went wrong during message parsing: {0}",
-                                exc);
-                            throw;
-                        }
-                    },
-                    _cancellationToken);
-            }
-            catch (DifferentAppProtocolVersionException)
-            {
-                _logger.Debug("Ignore message from peer with different version.");
-            }
-            catch (InvalidMessageException ex)
-            {
-                _logger.Error(ex, $"Could not parse NetMQMessage properly; ignore: {ex}");
-            }
-            catch (Exception ex)
-            {
-                _logger.Error(
-                    ex,
-                    $"An unexpected exception occurred during ReceiveMessage(): {ex}"
-                );
-            }
-        }
-
-        private void DoBroadcast(object sender, NetMQQueueEventArgs<(Address?, Message)> e)
-        {
-            (Address? except, Message msg) = e.Queue.Dequeue();
-
-            // FIXME Should replace with PUB/SUB model.
-            try
-            {
-                var peers = Protocol.PeersToBroadcast(except).ToList();
-                _logger.Debug($"Broadcasting message [{msg}]");
-                _logger.Debug($"Peers to broadcast : {peers.Count}");
-                peers.ParallelForEachAsync(async peer =>
-                {
-                    await SendMessageAsync(peer, msg);
-                });
-
-                _logger.Debug($"[{msg}] broadcasting completed.");
-            }
-            catch (TimeoutException ex)
-            {
-                _logger.Error(ex, $"TimeoutException occurred during {nameof(DoBroadcast)}().");
-            }
-            catch (Exception ex)
-            {
-                _logger.Error(
-                    ex,
-                    $"An unexpected exception occurred during {nameof(DoBroadcast)}()."
-                );
-            }
-        }
-
-        private void DoReply(object sender, NetMQQueueEventArgs<Message> e)
-        {
-            Message msg = e.Queue.Dequeue();
-
-            // FIXME: this works, but should be fixed.
-            if (msg is Pong pong)
-            {
-                pong.TipIndex = BlockChain.Tip?.Index;
-                msg = pong;
-            }
-
-            string identityHex = ByteUtil.Hex(msg.Identity);
-            _logger.Debug("Reply {Message} to {Identity}...", msg, identityHex);
-            NetMQMessage netMQMessage = msg.ToNetMQMessage(_privateKey, AsPeer);
-
-            // FIXME The current timeout value(1 sec) is arbitrary.
-            // We should make this configurable or fix it to an unneeded structure.
-            if (_router.TrySendMultipartMessage(TimeSpan.FromSeconds(1), netMQMessage))
-            {
-                _logger.Debug("A reply sent to {Identity}: {Message}", msg, identityHex);
-            }
-            else
-            {
-                _logger.Debug("Failed to reply to {Identity}: {Message}", msg, identityHex);
-            }
-        }
-
-        private async Task ProcessRuntime(
-            CancellationToken cancellationToken = default(CancellationToken))
+        private async Task ProcessFillblock(CancellationToken cancellationToken)
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                _logger.Verbose("Waiting for a new request...");
-                MessageRequest req = await _requests.TakeAsync(cancellationToken);
+                if (_demandBlockHash is null ||
+                    _demandBlockHash.Value.Item1 <= BlockChain.Tip.Index)
+                {
+                    await Task.Delay(100, cancellationToken);
+                    continue;
+                }
 
+                (long index, BoundPeer peer, HashDigest<SHA256> blockHash) =
+                    _demandBlockHash.Value;
                 try
                 {
-                    await ProcessRequest(req, cancellationToken);
+                    await SyncPreviousBlocksAsync(
+                        BlockChain,
+                        peer,
+                        blockHash,
+                        null,
+                        0,
+                        true,
+                        cancellationToken);
+
+                    // FIXME: Clean up events
+                    BlockReceived.Set();
+                    BlockAppended.Set();
+                    BroadcastBlock(peer.Address, BlockChain.Tip);
                 }
-                catch (OperationCanceledException)
+                catch (TimeoutException)
                 {
-                    _logger.Information("Cancellation requsted; shutdown runtime...");
-                    throw;
+                    _logger.Debug($"Timeout occurred during {nameof(ProcessFillblock)}");
+                    await Task.Delay(100, cancellationToken);
                 }
                 catch (Exception e)
                 {
-                    if (req.Retryable)
+                    var msg =
+                        $"Unexpected exception occurred during" +
+                        $" {nameof(ProcessFillblock)}: {{e}}";
+                    _logger.Error(e, msg, e);
+                }
+            }
+        }
+
+        private async Task ProcessFillTxs(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (_demandTxIds.IsEmpty)
+                {
+                    await Task.Delay(100, cancellationToken);
+                    continue;
+                }
+
+                _logger.Debug(
+                    "Processing txids: {@txIds}",
+                    _demandTxIds.Keys.Select(txid => txid.ToString()));
+                var demandTxIds = _demandTxIds.ToArray();
+                var demands = new Dictionary<BoundPeer, HashSet<TxId>>();
+
+                foreach (var kv in demandTxIds)
+                {
+                    if (!demands.ContainsKey(kv.Value))
                     {
-                        const int retryAfter = 100;
-                        _logger.Debug(
-                            $"Unexpected exception occurred during {nameof(ProcessRuntime)}(): " +
-                            "{Exception}; retry after {DelayMs} ms...",
-                            e,
-                            retryAfter
-                        );
-                        await _requests.AddAsync(req.Retry(), cancellationToken);
-                        await Task.Delay(retryAfter, cancellationToken);
+                        demands[kv.Value] = new HashSet<TxId>();
+                    }
+
+                    demands[kv.Value].Add(kv.Key);
+                }
+
+                var txs = new HashSet<Transaction<T>>();
+                var tasks = new List<Task<List<Transaction<T>>>>();
+                foreach (var kv in demands)
+                {
+                    IAsyncEnumerable<Transaction<T>> fetched =
+                        GetTxsAsync(kv.Key, kv.Value, cancellationToken);
+                    ValueTask<List<Transaction<T>>> vt = fetched.ToListAsync(cancellationToken);
+
+                    if (vt.IsCompletedSuccessfully)
+                    {
+                        txs.UnionWith(vt.Result);
                     }
                     else
                     {
-                        _logger.Error("Failed to process request[{req}]; discard it.", req);
+                        tasks.Add(vt.AsTask());
                     }
                 }
-            }
-        }
 
-        private async Task ProcessRequest(MessageRequest req, CancellationToken cancellationToken)
-        {
-            _logger.Verbose("Request {RequestId} taken.", req.Id);
+                try
+                {
+                    await tasks.WhenAll();
+                }
+                catch (Exception)
+                {
+                    _logger.Information(
+                        $"Some tasks faulted during {nameof(GetTxsAsync)}().");
+                }
 
-            using (var dealer = new DealerSocket(ToNetMQAddress(req.Peer)))
-            {
-                // FIXME 1 min is an arbitrary value.
-                // See also https://github.com/planetarium/libplanet/pull/599 and
-                // https://github.com/planetarium/libplanet/pull/709
-                dealer.Options.Linger = TimeSpan.FromMinutes(1);
+                foreach (Task<List<Transaction<T>>> task in tasks)
+                {
+                    if (!task.IsFaulted)
+                    {
+                        // `task.Result` is okay because we've already waited.
+                        txs.UnionWith(task.Result);
+                    }
+                }
 
+                foreach (Transaction<T> tx in txs)
+                {
+                    try
+                    {
+                        BlockChain.StageTransaction(tx);
+                    }
+                    catch (InvalidTxException ite)
+                    {
+                        _logger.Error(
+                            ite,
+                            "{TxId} will not be staged since it is invalid.",
+                            tx.Id
+                        );
+                    }
+
+                    if (!BlockChain.Policy.DoesTransactionFollowsPolicy(tx))
+                    {
+                        BlockChain.UnstageTransaction(tx);
+                    }
+                }
+
+                TxReceived.Set();
                 _logger.Debug(
-                    "Trying to send {Message} to {Peer}...",
-                    req.Message,
-                    req.Peer
-                );
-                var message = req.Message.ToNetMQMessage(_privateKey, AsPeer);
-                var result = new List<Message>();
-                TaskCompletionSource<IEnumerable<Message>> tcs = req.TaskCompletionSource;
-                try
+                    "Txs staged successfully: {@txIds}",
+                    txs.Select(tx => tx.Id.ToString()));
+
+                // FIXME: Should exclude peers of source of the transaction ids.
+                BroadcastTxs(null, txs);
+
+                foreach (var kv in demandTxIds)
                 {
-                    await dealer.SendMultipartMessageAsync(
-                        message,
-                        timeout: req.Timeout,
-                        cancellationToken: cancellationToken
-                    );
-
-                    _logger.Debug("A message {Message} sent.", req.Message);
-
-                    foreach (var i in Enumerable.Range(0, req.ExpectedResponses))
-                    {
-                        NetMQMessage raw = await dealer.ReceiveMultipartMessageAsync(
-                            timeout: req.Timeout,
-                            cancellationToken: cancellationToken
-                        );
-                        _logger.Verbose(
-                            "A raw message ({FrameCount} frames) has replied.",
-                            raw.FrameCount
-                        );
-                        Message reply = Message.Parse(raw, true);
-                        _logger.Debug(
-                            "A reply has parsed: {Reply} from {ReplyRemote}",
-                            reply,
-                            reply.Remote
-                        );
-
-                        result.Add(reply);
-                    }
-
-                    tcs.SetResult(result);
+                    _demandTxIds.TryRemove(kv.Key, out BoundPeer value);
                 }
-                catch (TimeoutException te)
-                {
-                    tcs.SetException(te);
-                }
-
-                // Delaying dealer disposing to avoid ObjectDisposedException on NetMQPoller
-                await Task.Delay(100, cancellationToken);
-            }
-        }
-
-        private void CheckStarted()
-        {
-            if (!Running)
-            {
-                throw new NoSwarmContextException("Swarm hasn't started yet.");
-            }
-        }
-
-        private string ToNetMQAddress(BoundPeer peer)
-        {
-            return $"tcp://{peer.EndPoint.Host}:{peer.EndPoint.Port}";
-        }
-
-        private async Task CreatePermission(BoundPeer peer)
-        {
-            IPAddress[] ips;
-            if (peer.PublicIPAddress is null)
-            {
-                string peerHost = peer.EndPoint.Host;
-                if (IPAddress.TryParse(peerHost, out IPAddress asIp))
-                {
-                    ips = new[] { asIp };
-                }
-                else
-                {
-                    ips = await Dns.GetHostAddressesAsync(peerHost);
-                }
-            }
-            else
-            {
-                ips = new[] { peer.PublicIPAddress };
-            }
-
-            foreach (IPAddress ip in ips)
-            {
-                var ep = new IPEndPoint(ip, peer.EndPoint.Port);
-                if (IPAddress.IsLoopback(ip))
-                {
-                    // This translation is only used in test case because a
-                    // seed node exposes loopback address as public address to
-                    // other node in test case
-                    ep = await _turnClient.GetMappedAddressAsync();
-                }
-
-                // FIXME Can we really ignore IPv6 case?
-                if (ip.AddressFamily.Equals(AddressFamily.InterNetwork))
-                {
-                    await _turnClient.CreatePermissionAsync(ep);
-                }
-            }
-        }
-
-        private void ValidateSender(Peer peer)
-        {
-            if (peer.AppProtocolVersion != _appProtocolVersion)
-            {
-                DifferentProtocolVersionEventArgs args =
-                    new DifferentProtocolVersionEventArgs
-                    {
-                        ExpectedVersion = _appProtocolVersion,
-                        ActualVersion = peer.AppProtocolVersion,
-                    };
-
-                DifferentVersionPeerEncountered?.Invoke(this, args);
-
-                throw new DifferentAppProtocolVersionException(
-                    $"Peer protocol version is different.",
-                    _appProtocolVersion,
-                    peer.AppProtocolVersion);
-            }
-        }
-
-        private async Task RefreshTableAsync(
-            TimeSpan period,
-            TimeSpan maxAge,
-            CancellationToken cancellationToken)
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(period, cancellationToken);
-                    await Protocol.RefreshTableAsync(maxAge, cancellationToken);
-                    await Protocol.CheckReplacementCacheAsync(cancellationToken);
-                }
-                catch (OperationCanceledException e)
-                {
-                    _logger.Warning(e, $"{nameof(RefreshTableAsync)}() is cancelled.");
-                    throw;
-                }
-            }
-        }
-
-        private async Task RebuildConnectionAsync(
-            TimeSpan period,
-            CancellationToken cancellationToken)
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await Protocol.RebuildConnectionAsync(cancellationToken);
-                    await Task.Delay(period, cancellationToken);
-                }
-                catch (OperationCanceledException e)
-                {
-                    _logger.Warning(e, $"{nameof(RebuildConnectionAsync)}() is cancelled.");
-                    throw;
-                }
-            }
-        }
-
-        private readonly struct MessageRequest
-        {
-            private readonly int _retried;
-
-            public MessageRequest(
-                in Guid id,
-                Message message,
-                BoundPeer peer,
-                in TimeSpan? timeout,
-                in int expectedResponses,
-                TaskCompletionSource<IEnumerable<Message>> taskCompletionSource)
-                : this(
-                      id,
-                      message,
-                      peer,
-                      timeout,
-                      expectedResponses,
-                      taskCompletionSource,
-                      0
-                    )
-            {
-            }
-
-            internal MessageRequest(
-                in Guid id,
-                Message message,
-                BoundPeer peer,
-                in TimeSpan? timeout,
-                in int expectedResponses,
-                TaskCompletionSource<IEnumerable<Message>> taskCompletionSource,
-                int retried)
-            {
-                Id = id;
-                Message = message;
-                Peer = peer;
-                Timeout = timeout;
-                ExpectedResponses = expectedResponses;
-                TaskCompletionSource = taskCompletionSource;
-                _retried = retried;
-            }
-
-            public Guid Id { get; }
-
-            public Message Message { get; }
-
-            public BoundPeer Peer { get; }
-
-            public TimeSpan? Timeout { get; }
-
-            public int ExpectedResponses { get; }
-
-            public TaskCompletionSource<IEnumerable<Message>> TaskCompletionSource { get; }
-
-            public bool Retryable => _retried < 10;
-
-            public MessageRequest Retry()
-            {
-                return new MessageRequest(
-                    Id,
-                    Message,
-                    Peer,
-                    Timeout,
-                    ExpectedResponses,
-                    TaskCompletionSource,
-                    _retried + 1
-                );
             }
         }
     }

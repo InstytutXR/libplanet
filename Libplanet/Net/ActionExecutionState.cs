@@ -24,6 +24,12 @@ namespace Libplanet.Net
         public HashDigest<SHA256> ExecutedBlockHash { get; internal set; }
 
         /// <inheritdoc />
-        public override int CurrentPhase => 4;
+        public override int CurrentPhase => 5;
+
+        public static bool operator ==(ActionExecutionState left, ActionExecutionState right) =>
+            Operator.Weave(left, right);
+
+        public static bool operator !=(ActionExecutionState left, ActionExecutionState right) =>
+            Operator.Weave(left, right);
     }
 }

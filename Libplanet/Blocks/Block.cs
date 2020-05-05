@@ -1,24 +1,22 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics.Contracts;
 using System.Globalization;
-using System.IO;
 using System.Linq;
 using System.Numerics;
-using System.Runtime.Serialization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using Bencodex;
+using Bencodex.Types;
 using Libplanet.Action;
-using Libplanet.Serialization;
 using Libplanet.Tx;
 
 namespace Libplanet.Blocks
 {
     [Equals]
-    public class Block<T> : ISerializable
+    public class Block<T>
         where T : IAction, new()
     {
         internal const string TimestampFormat = "yyyy-MM-ddTHH:mm:ss.ffffffZ";
@@ -64,7 +62,16 @@ namespace Libplanet.Blocks
             PreviousHash = previousHash;
             Timestamp = timestamp;
             Transactions = transactions.OrderBy(tx => tx.Id).ToArray();
-            Hash = Hashcash.Hash(ToBencodex(false, false));
+            var codec = new Codec();
+            TxHash = Transactions.Any()
+                ? Hashcash.Hash(
+                    codec.Encode(
+                        new Bencodex.Types.List(Transactions.Select(tx =>
+                            (IValue)tx.ToBencodex(true)))))
+                : (HashDigest<SHA256>?)null;
+
+            // FIXME: This does not need to be computed every time?
+            Hash = Hashcash.Hash(SerializeForHash());
 
             // As the order of transactions should be unpredictable until a block is mined,
             // the sorter key should be derived from both a block hash and a txid.
@@ -101,29 +108,34 @@ namespace Libplanet.Blocks
                 .ToImmutableArray();
         }
 
-        protected Block(SerializationInfo info, StreamingContext context)
-            : this(new RawBlock(info, context))
+        /// <summary>
+        /// Creates a <see cref="Block{T}"/> instance from its serialization.
+        /// </summary>
+        /// <param name="dict">The <see cref="Bencodex.Types.Dictionary"/>
+        /// representation of <see cref="Block{T}"/> instance.
+        /// </param>
+        public Block(Bencodex.Types.Dictionary dict)
+            : this(new RawBlock(dict))
         {
         }
 
         private Block(RawBlock rb)
             : this(
-                rb.Index,
-                rb.Difficulty,
-                new Nonce(rb.Nonce),
-                rb.Miner is null ? (Address?)null : new Address(rb.Miner),
+                rb.Header.Index,
+                rb.Header.Difficulty,
+                new Nonce(rb.Header.Nonce.ToArray()),
+                rb.Header.Miner.Any() ? new Address(rb.Header.Miner) : (Address?)null,
 #pragma warning disable MEN002 // Line is too long
-                rb.PreviousHash is null ? (HashDigest<SHA256>?)null : new HashDigest<SHA256>(rb.PreviousHash),
+                rb.Header.PreviousHash.Any() ? new HashDigest<SHA256>(rb.Header.PreviousHash.ToArray()) : (HashDigest<SHA256>?)null,
 #pragma warning restore MEN002 // Line is too long
                 DateTimeOffset.ParseExact(
-                    rb.Timestamp,
+                    rb.Header.Timestamp,
                     TimestampFormat,
                     CultureInfo.InvariantCulture).ToUniversalTime(),
                 rb.Transactions
-                    .Cast<Dictionary<string, object>>()
-                    .Select(d => new Transaction<T>(new RawTransaction(d)))
+                    .Select(tx => Transaction<T>.Deserialize(tx.ToArray()))
                     .ToList()
-                )
+            )
         {
         }
 
@@ -148,7 +160,16 @@ namespace Libplanet.Blocks
         public DateTimeOffset Timestamp { get; }
 
         [IgnoreDuringEquals]
+        public HashDigest<SHA256>? TxHash { get; }
+
+        [IgnoreDuringEquals]
         public IEnumerable<Transaction<T>> Transactions { get; }
+
+        public static bool operator ==(Block<T> left, Block<T> right) =>
+            Operator.Weave(left, right);
+
+        public static bool operator !=(Block<T> left, Block<T> right) =>
+            Operator.Weave(left, right);
 
         /// <summary>
         /// Generate a block with given <paramref name="transactions"/>.
@@ -188,8 +209,8 @@ namespace Libplanet.Blocks
 
             // Poor man' way to optimize stamp...
             // FIXME: We need to rather reorganize the serialization layout.
-            byte[] emptyNonce = MakeBlock(new Nonce(new byte[0])).ToBencodex(false, false);
-            byte[] oneByteNonce = MakeBlock(new Nonce(new byte[1])).ToBencodex(false, false);
+            byte[] emptyNonce = MakeBlock(new Nonce(new byte[0])).SerializeForHash();
+            byte[] oneByteNonce = MakeBlock(new Nonce(new byte[1])).SerializeForHash();
             int offset = 0;
             while (offset < emptyNonce.Length && emptyNonce[offset].Equals(oneByteNonce[offset]))
             {
@@ -229,30 +250,34 @@ namespace Libplanet.Blocks
             return MakeBlock(nonce);
         }
 
-        public static Block<T> FromBencodex(byte[] encoded)
+        /// <summary>
+        /// Decodes a <see cref="Block{T}"/>'s
+        /// <a href="https://bencodex.org/">Bencodex</a> representation.
+        /// </summary>
+        /// <param name="bytes">A <a href="https://bencodex.org/">Bencodex</a>
+        /// representation of a <see cref="Block{T}"/>.</param>
+        /// <returns>A decoded <see cref="Block{T}"/> object.</returns>
+        /// <seealso cref="Serialize()"/>
+        public static Block<T> Deserialize(byte[] bytes)
         {
-            var serializer = new BencodexFormatter<Block<T>>();
-            using (var stream = new MemoryStream(encoded))
+            IValue value = new Codec().Decode(bytes);
+            if (!(value is Bencodex.Types.Dictionary dict))
             {
-                return (Block<T>)serializer.Deserialize(stream);
+                throw new DecodingException(
+                    $"Expected {typeof(Bencodex.Types.Dictionary)} but " +
+                    $"{value.GetType()}");
             }
+
+            return new Block<T>(dict);
         }
 
-        public byte[] ToBencodex(bool hash, bool transactionData)
+        public byte[] Serialize()
         {
-            var serializer = new BencodexFormatter<Block<T>>
-            {
-                Context = new StreamingContext(
-                    StreamingContextStates.All,
-                    new BlockSerializationContext(hash, transactionData)
-                ),
-            };
-            using (var stream = new MemoryStream())
-            {
-                serializer.Serialize(stream, this);
-                return stream.ToArray();
-            }
+            var codec = new Codec();
+            return codec.Encode(ToBencodex());
         }
+
+        public Bencodex.Types.Dictionary ToBencodex() => ToRawBlock().ToBencodex();
 
         /// <summary>
         /// Executes every <see cref="IAction"/> in the
@@ -382,26 +407,40 @@ namespace Libplanet.Blocks
             return txEvaluations.Select(te => te.Item2);
         }
 
+        /// <summary>
+        /// Gets <see cref="BlockDigest"/> representation of the <see cref="Block{T}"/>.
+        /// </summary>
+        /// <returns><see cref="BlockDigest"/> representation of the <see cref="Block{T}"/>.
+        /// </returns>
+        public BlockDigest ToBlockDigest()
+        {
+            return new BlockDigest(
+                header: GetBlockHeader(),
+                txIds: Transactions
+                    .Select(tx => tx.Id.ToByteArray().ToImmutableArray())
+                    .ToImmutableArray());
+        }
+
         public override string ToString()
         {
             return Hash.ToString();
         }
 
-        public void GetObjectData(
-            SerializationInfo info,
-            StreamingContext context
-        )
+        internal BlockHeader GetBlockHeader()
         {
-            bool includeHash = false;
-            bool includeTransactionData = false;
-            if (context.Context is BlockSerializationContext serialCtx)
-            {
-                includeHash = serialCtx.IncludeHash;
-                includeTransactionData = serialCtx.IncludeTransactionData;
-            }
-
-            RawBlock rawBlock = ToRawBlock(includeHash, includeTransactionData);
-            rawBlock.GetObjectData(info, context);
+            // FIXME: When hash is not assigned, should throw an exception.
+            return new BlockHeader(
+                index: Index,
+                timestamp: Timestamp.ToString(TimestampFormat, CultureInfo.InvariantCulture),
+                nonce: Nonce.ToByteArray().ToImmutableArray(),
+                miner: Miner?.ToByteArray().ToImmutableArray() ?? ImmutableArray<byte>.Empty,
+                difficulty: Difficulty,
+#pragma warning disable MEN002 // line is too long
+                previousHash: PreviousHash?.ToByteArray().ToImmutableArray() ?? ImmutableArray<byte>.Empty,
+#pragma warning restore MEN002 // line is too long
+                txHash: TxHash?.ToByteArray().ToImmutableArray() ?? ImmutableArray<byte>.Empty,
+                hash: Hash.ToByteArray().ToImmutableArray()
+            );
         }
 
         internal void Validate(DateTimeOffset currentTime)
@@ -473,33 +512,41 @@ namespace Libplanet.Blocks
             }
         }
 
-        internal RawBlock ToRawBlock(
-            bool includeHash,
-            bool includeTransactionData
-        )
+        internal RawBlock ToRawBlock()
         {
-            IEnumerable transactions =
-                Transactions.OrderBy(tx => tx.Id).Select(
-                    tx => includeTransactionData
-                        ? tx.ToRawTransaction(true) as object
-                        : tx.Id.ToByteArray() as object
-                );
-            var rawBlock = new RawBlock(
-                index: Index,
-                timestamp: Timestamp.ToString(TimestampFormat, CultureInfo.InvariantCulture),
-                nonce: Nonce.ToByteArray(),
-                miner: Miner?.ToByteArray(),
-                difficulty: Difficulty,
-                transactions: transactions,
-                previousHash: PreviousHash?.ToByteArray()
-            );
+            // For consistency, order transactions by its id.
+            return new RawBlock(
+                header: GetBlockHeader(),
+                transactions: Transactions.OrderBy(tx => tx.Id)
+                    .Select(tx => tx.Serialize(true).ToImmutableArray()).ToImmutableArray());
+        }
 
-            if (includeHash)
+        private byte[] SerializeForHash()
+        {
+            var dict = Bencodex.Types.Dictionary.Empty
+                .Add("index", Index)
+                .Add(
+                    "timestamp",
+                    Timestamp.ToString(TimestampFormat, CultureInfo.InvariantCulture))
+                .Add("difficulty", Difficulty)
+                .Add("nonce", Nonce.ToByteArray());
+
+            if (!(Miner is null))
             {
-                rawBlock = rawBlock.AddHash(Hash.ToByteArray());
+                dict = dict.Add("reward_beneficiary", Miner.Value.ToByteArray());
             }
 
-            return rawBlock;
+            if (!(PreviousHash is null))
+            {
+                dict = dict.Add("previous_hash", PreviousHash.Value.ToByteArray());
+            }
+
+            if (!(TxHash is null))
+            {
+                dict = dict.Add("transaction_fingerprint", TxHash.Value.ToByteArray());
+            }
+
+            return new Codec().Encode(dict);
         }
 
         private readonly struct BlockSerializationContext
